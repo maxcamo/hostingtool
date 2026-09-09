@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
-VERSION="3.0.0"
-HARDENING_VERSION="v3"
+VERSION="4.0.0"
+HARDENING_VERSION="v4"
 
 NGINX_DIR="/etc/nginx"
 SITE_DIR="$NGINX_DIR/sitesmuggler"
@@ -11,6 +12,7 @@ REPORT_DIR="/root/sitesmuggler-reports"
 BACKUP_ROOT="/root/sitesmuggler-backups"
 
 DOMAIN="${1:-}"
+MEDIA_ACTION_ARG="${2:-}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 FAIL=0
@@ -273,7 +275,7 @@ echo "============================================================"
 mkdir -p "$SITE_DIR"
 cat > "$HARDEN_CONF" <<'EOF'
 # ============================================================
-# SITESMUGGLER - Magento 2 Nginx Hardening - V3
+# SITESMUGGLER - Magento 2 Nginx Hardening - V4
 # Context: server {}
 # ============================================================
 
@@ -339,9 +341,16 @@ if target is None and len(blocks)==1: target=blocks[0]
 if target is None: raise SystemExit('Impossibile determinare server{} Magento')
 start,end,block,names=target
 
-include_added=0; include_upgraded=0; custom_options_fixed=0; php_handler_anchored=0; php_handler_already_safe=0
+include_added=0; include_upgraded=0; custom_options_fixed=0; php_handler_restored=0
 
-old_include_pattern=re.compile(r'(?m)^[ \t]*include[ \t]+/etc/nginx/sitesmuggler/hardening-magento2-v[0-9]+\.conf[ \t]*;[ \t]*$')
+# Rileva eventuali include SiteSmuggler precedenti PRIMA della migrazione.
+# Le versioni <= v3 potevano aver ancorato automaticamente l'handler PHP Magento.
+old_include_pattern=re.compile(
+    r'(?m)^[ \t]*include[ \t]+/etc/nginx/sitesmuggler/hardening-magento2-v([0-9]+)\.conf[ \t]*;[ \t]*$'
+)
+legacy_versions=[int(x) for x in old_include_pattern.findall(block)]
+legacy_needs_php_restore=any(v <= 3 for v in legacy_versions)
+
 new_line=f'    include {include_path};'
 replaced=old_include_pattern.sub(new_line, block)
 if replaced != block: include_upgraded=1
@@ -361,26 +370,30 @@ if include_path not in block:
         include_added=1; inserted=True; break
     if not inserted: raise SystemExit('Nessun punto sicuro per include SiteSmuggler')
 
+# Con root $MAGE_ROOT/pub l'URI corretto è /media/custom_options/.
 block,custom_options_fixed=re.subn(
     r'(?m)^([ \t]*location(?:[ \t]+\^~)?[ \t]+)/pub/media/custom_options/([ \t]*\{)',
     r'\1/media/custom_options/\2', block
 )
 
-already_safe=re.search(r'(?m)^[ \t]*location\s+~\s+\^/\([^\)\n]*\bindex\b[^\)\n]*\)(?:\\\.|\.)php\$\s*\{', block)
-if already_safe:
-    php_handler_already_safe=1
-else:
-    pattern=re.compile(r'(?m)^([ \t]*)location\s+~\s+\(([^\)\n]*\bindex\b[^\)\n]*)\)(?:\\\.|\.)php\$\s*\{')
-    def repl(m): return f'{m.group(1)}location ~ ^/({m.group(2)})\\.php$ {{'
-    block,php_handler_anchored=pattern.subn(repl, block, count=1)
+# V4: NON ancora più automaticamente l'handler PHP Magento.
+# Magento custom/multiregione può usare /eu/index.php, /it/index.php, ecc.
+# Se rileviamo un'installazione proveniente da SiteSmuggler <= v3,
+# ripristiniamo SOLO l'ancoraggio che le versioni precedenti avevano introdotto.
+if legacy_needs_php_restore:
+    anchored_pattern=re.compile(
+        r'(?m)^([ \t]*)location\s+~\s+\^/\(([^\)\n]*\bindex\b[^\)\n]*)\)(?:\\\.|\.)php\$\s*\{'
+    )
+    def restore_handler(m):
+        return f'{m.group(1)}location ~ ({m.group(2)})\\.php$ {{'
+    block,php_handler_restored=anchored_pattern.subn(restore_handler, block, count=1)
 
 generic_php_deny=bool(re.search(r'location\s+~\*?\s+[^{}\n]*\\?\.php\$\s*\{[^{}]*return\s+404', block, re.I|re.S))
 vhost.write_text(text[:start]+block+text[end:])
 print(f'include_added={include_added}')
 print(f'include_upgraded={include_upgraded}')
 print(f'custom_options_fixed={custom_options_fixed}')
-print(f'php_handler_anchored={php_handler_anchored}')
-print(f'php_handler_already_safe={php_handler_already_safe}')
+print(f'php_handler_restored={php_handler_restored}')
 print(f'generic_php_deny={int(generic_php_deny)}')
 PY
 )"
@@ -415,23 +428,147 @@ echo
 echo "============================================================"
 echo " 6. EXISTING EXECUTABLE FILE CHECK"
 echo "============================================================"
-if [ -d "$MAGE_ROOT/pub/media" ]; then
-    mapfile -t EXISTING_EXEC < <(
-        find "$MAGE_ROOT/pub/media" -type f \( \
-            -iname '*.php' -o -iname '*.php3' -o -iname '*.php4' -o -iname '*.php5' -o \
-            -iname '*.php7' -o -iname '*.php8' -o -iname '*.phtml' -o -iname '*.phar' -o -iname '*.phps' \
-        \) 2>/dev/null | head -100
-    )
-    if [ "${#EXISTING_EXEC[@]}" -gt 0 ]; then
-        echo
-        warn "Trovati file eseguibili già presenti in pub/media:"
-        for FILE in "${EXISTING_EXEC[@]}"; do echo "       $FILE"; done
-        warn "NON vengono cancellati automaticamente; vanno analizzati."
+
+MEDIA_ACTION_RESULT="none"
+MEDIA_EXEC_COUNT=0
+MEDIA_ROOT="$MAGE_ROOT/pub/media"
+
+scan_media_executables(){
+    EXISTING_EXEC=()
+    if [ -d "$MEDIA_ROOT" ]; then
+        mapfile -d '' -t EXISTING_EXEC < <(
+            find "$MEDIA_ROOT" -type f \( \
+                -iname '*.php' -o -iname '*.php[0-9]*' -o -iname '*.phtml' -o \
+                -iname '*.phar'  -o -iname '*.phps' \
+            \) -print0 2>/dev/null
+        )
+    fi
+}
+
+scan_media_executables
+MEDIA_EXEC_COUNT="${#EXISTING_EXEC[@]}"
+
+if [ "$MEDIA_EXEC_COUNT" -gt 0 ]; then
+    echo
+    warn "Trovati $MEDIA_EXEC_COUNT file eseguibili già presenti in pub/media:"
+
+    DISPLAY_LIMIT=200
+    DISPLAYED=0
+    for FILE in "${EXISTING_EXEC[@]}"; do
+        echo "       $FILE"
+        DISPLAYED=$((DISPLAYED + 1))
+        if [ "$DISPLAYED" -ge "$DISPLAY_LIMIT" ]; then
+            break
+        fi
+    done
+
+    if [ "$MEDIA_EXEC_COUNT" -gt "$DISPLAY_LIMIT" ]; then
+        echo "       ... altri $((MEDIA_EXEC_COUNT - DISPLAY_LIMIT)) file non mostrati"
+    fi
+
+    echo
+    echo "Azione sui file trovati:"
+    echo "  [Q] Quarantena fuori dal webroot (CONSIGLIATO)"
+    echo "  [D] Cancella definitivamente"
+    echo "  [N] Nessuna azione, lascia i file dove sono"
+    echo
+
+    MEDIA_ACTION="${SITESMUGGLER_MEDIA_ACTION:-${MEDIA_ACTION_ARG:-}}"
+
+    if [ -z "$MEDIA_ACTION" ]; then
+        if [ -t 0 ]; then
+            read -r -p "Scelta [Q]: " MEDIA_ACTION
+            MEDIA_ACTION="${MEDIA_ACTION:-Q}"
+        else
+            MEDIA_ACTION="N"
+            warn "Sessione non interattiva: nessuna rimozione automatica"
+        fi
+    fi
+
+    MEDIA_ACTION="$(printf '%s' "$MEDIA_ACTION" | tr '[:upper:]' '[:lower:]')"
+
+    case "$MEDIA_ACTION" in
+        q|quarantine|quarantena)
+            QUARANTINE_DIR="/root/sitesmuggler-quarantine/${DOMAIN}-${STAMP}"
+            MANIFEST="$QUARANTINE_DIR/manifest.tsv"
+            mkdir -p "$QUARANTINE_DIR"
+            printf 'sha256\toriginal_path\tquarantine_path\n' > "$MANIFEST"
+
+            MOVED=0
+            for FILE in "${EXISTING_EXEC[@]}"; do
+                [ -f "$FILE" ] || continue
+                REL="${FILE#"$MEDIA_ROOT"/}"
+                DEST="$QUARANTINE_DIR/$REL"
+                mkdir -p "$(dirname "$DEST")"
+                HASH="$(sha256sum -- "$FILE" | awk '{print $1}')"
+                printf '%s\t%s\t%s\n' "$HASH" "$FILE" "$DEST" >> "$MANIFEST"
+                mv -- "$FILE" "$DEST"
+                MOVED=$((MOVED + 1))
+            done
+
+            chmod -R go-rwx "$QUARANTINE_DIR" 2>/dev/null || true
+            MEDIA_ACTION_RESULT="quarantined:$MOVED"
+            ok "Quarantena completata: $MOVED file"
+            ok "Directory: $QUARANTINE_DIR"
+            ;;
+
+        d|delete|cancella|cancellazione)
+            CONFIRM="${SITESMUGGLER_MEDIA_DELETE_CONFIRM:-}"
+
+            if [ "$CONFIRM" != "DELETE" ]; then
+                if [ -t 0 ]; then
+                    echo
+                    warn "CANCELLAZIONE DEFINITIVA di $MEDIA_EXEC_COUNT file"
+                    read -r -p "Scrivi DELETE per confermare: " CONFIRM
+                fi
+            fi
+
+            if [ "$CONFIRM" != "DELETE" ]; then
+                warn "Cancellazione annullata. Nessun file rimosso."
+                MEDIA_ACTION_RESULT="none"
+            else
+                DELETE_MANIFEST_DIR="/root/sitesmuggler-deletion-manifests"
+                DELETE_MANIFEST="$DELETE_MANIFEST_DIR/${DOMAIN}-${STAMP}.tsv"
+                mkdir -p "$DELETE_MANIFEST_DIR"
+                printf 'sha256\tdeleted_path\n' > "$DELETE_MANIFEST"
+
+                DELETED=0
+                for FILE in "${EXISTING_EXEC[@]}"; do
+                    [ -f "$FILE" ] || continue
+                    HASH="$(sha256sum -- "$FILE" | awk '{print $1}')"
+                    printf '%s\t%s\n' "$HASH" "$FILE" >> "$DELETE_MANIFEST"
+                    rm -f -- "$FILE"
+                    DELETED=$((DELETED + 1))
+                done
+
+                MEDIA_ACTION_RESULT="deleted:$DELETED"
+                ok "Cancellazione completata: $DELETED file"
+                ok "Manifest SHA256: $DELETE_MANIFEST"
+            fi
+            ;;
+
+        n|none|no|nessuna)
+            MEDIA_ACTION_RESULT="none"
+            warn "File lasciati sul filesystem. L'hardening ne blocca l'accesso HTTP."
+            ;;
+
+        *)
+            MEDIA_ACTION_RESULT="none"
+            warn "Scelta non riconosciuta: nessuna azione sui file"
+            ;;
+    esac
+
+    # Verifica dopo eventuale quarantena/cancellazione.
+    scan_media_executables
+    REMAINING_EXEC_COUNT="${#EXISTING_EXEC[@]}"
+
+    if [ "$REMAINING_EXEC_COUNT" -eq 0 ]; then
+        pass "Executable files rimasti in pub/media" "NESSUNO"
     else
-        pass "Executable files già presenti in pub/media" "NESSUNO"
+        warn "Restano $REMAINING_EXEC_COUNT file eseguibili in pub/media"
     fi
 else
-    warn "Directory pub/media non trovata"
+    pass "Executable files già presenti in pub/media" "NESSUNO"
 fi
 
 TMPDIR="$(mktemp -d /tmp/sitesmuggler.XXXXXX)"
@@ -458,7 +595,7 @@ request_graphql(){
 request_public(){
     local HOST="$1" URI="$2" OUTPUT="$3" CODE RC
     set +e
-    CODE="$(curl -ksS --max-time 15 -o "$OUTPUT" -w "%{http_code}" "https://${HOST}${URI}")"
+    CODE="$(curl -ksSL --max-redirs 5 --max-time 20 -o "$OUTPUT" -w "%{http_code}" "https://${HOST}${URI}")"
     RC=$?
     set -e
     [ "$RC" -eq 0 ] && printf "%s" "$CODE" || printf "000"
@@ -551,7 +688,12 @@ echo "============================================================"
 for STORE in "${STORES[@]}"; do
     BODY="$TMPDIR/public-$(printf '%s' "$STORE" | tr '.' '_')"
     CODE="$(request_public "$STORE" "/" "$BODY")"
-    case "$CODE" in 2??|3??|401|403) pass "HTTPS $STORE" "HTTP $CODE" ;; *) warn "HTTPS $STORE" "HTTP $CODE" ;; esac
+    case "$CODE" in
+        2??|3??|401|403) pass "HTTPS $STORE (redirect final)" "HTTP $CODE" ;;
+        000) warn "HTTPS $STORE" "HTTP 000 - DNS/connessione non disponibile" ;;
+        4??|5??) fail "HTTPS $STORE (redirect final)" "HTTP $CODE" ;;
+        *) warn "HTTPS $STORE" "HTTP $CODE" ;;
+    esac
 done
 
 echo
@@ -566,6 +708,7 @@ if [ "$FAIL" -eq 0 ]; then
     echo "Magento     : $MAGE_ROOT"
     echo "Backend     : $BACKEND"
     echo "Hardening   : $HARDEN_CONF"
+echo "Media action: $MEDIA_ACTION_RESULT"
     echo "Backup      : $BACKUP_DIR/$(basename "$VHOST")"
     echo "Report      : $REPORT"
     echo
