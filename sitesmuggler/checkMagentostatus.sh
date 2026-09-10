@@ -2,7 +2,7 @@
 
 set -u
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 TARGET="${1:-}"
 TMPDIR=""
 BASE_URL=""
@@ -20,6 +20,10 @@ TTFB_MIN=""
 TTFB_MAX=""
 TTFB_VALID=0
 TTFB_RUNS=10
+JS_CDN_RESULT="non determinata"
+IMG_CDN_RESULT="non determinata"
+JS_ASSET_HOSTS=""
+IMG_ASSET_HOSTS=""
 
 cleanup() {
     [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"
@@ -62,7 +66,7 @@ public_get() {
     local URL="$1" BODY="$2" HEADERS="$3" META RC
     set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.2' \
+        -A 'SiteSmuggler-MagentoStatus/1.3' \
         -D "$HEADERS" -o "$BODY" \
         -w '%{http_code}|%{url_effective}|%{remote_ip}' \
         "$URL" 2>/dev/null)"
@@ -80,7 +84,7 @@ public_post_json() {
     local URL="$1" JSON="$2" BODY="$3" HEADERS="$4" META RC
     set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.2' \
+        -A 'SiteSmuggler-MagentoStatus/1.3' \
         -X POST -H 'Content-Type: application/json' \
         --data "$JSON" \
         -D "$HEADERS" -o "$BODY" \
@@ -100,7 +104,7 @@ public_post_form() {
     local URL="$1" BODY="$2" HEADERS="$3" META RC
     set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.2' \
+        -A 'SiteSmuggler-MagentoStatus/1.3' \
         -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
         --data 'sitesmuggler_probe=1' \
         -D "$HEADERS" -o "$BODY" \
@@ -207,7 +211,7 @@ scan_home_js_for_version() {
 
         JSFILE="$TMPDIR/js-$COUNT"
         curl -ksSL --connect-timeout 5 --max-time 10 \
-            -A 'SiteSmuggler-MagentoStatus/1.2' \
+            -A 'SiteSmuggler-MagentoStatus/1.3' \
             -o "$JSFILE" "$JSURL" 2>/dev/null || true
 
         if [ -s "$JSFILE" ]; then
@@ -308,6 +312,180 @@ run_ttfb_benchmark() {
     print_line "[INFO] Valid runs" "${TTFB_VALID}/${RUNS}"
     print_line "[INFO] Avg DNS / CONNECT / TLS" "${AVG_DNS:-n/d} / ${AVG_CONNECT:-n/d} / ${AVG_TLS:-n/d} ms"
     print_line "[INFO] Avg total response" "${AVG_TOTAL:-n/d} ms"
+}
+
+asset_host() {
+    local URL="$1" H
+    H="${URL#*://}"
+    H="${H%%/*}"
+    H="${H%%:*}"
+    printf '%s' "$H" | tr '[:upper:]' '[:lower:]'
+}
+
+resolve_asset_url() {
+    local SRC="$1" PAGE_URL="$2" SCHEME BASE
+    SCHEME="${PAGE_URL%%:*}"
+    case "$SCHEME" in http|https) ;; *) SCHEME="https" ;; esac
+
+    case "$SRC" in
+        data:*|blob:*|javascript:*|'') return 1 ;;
+        //*) printf '%s:%s' "$SCHEME" "$SRC" ;;
+        http://*|https://*) printf '%s' "$SRC" ;;
+        /*) printf '%s://%s%s' "$SCHEME" "$DOMAIN" "$SRC" ;;
+        *)
+            BASE="${PAGE_URL%%\?*}"
+            BASE="${BASE%/*}"
+            printf '%s/%s' "$BASE" "$SRC"
+            ;;
+    esac
+}
+
+cdn_provider_from_host_headers() {
+    local HOST="$1" HEADERS="$2" TEXT
+    TEXT="$(cat "$HEADERS" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+    HOST="$(printf '%s' "$HOST" | tr '[:upper:]' '[:lower:]')"
+
+    if [[ "$HOST" == *cloudfront.net ]] || grep -Eq 'x-amz-cf-id:|x-amz-cf-pop:|server:[[:space:]]*cloudfront' <<< "$TEXT"; then
+        printf 'AWS CloudFront'
+    elif [[ "$HOST" == *cloudflare.net ]] || grep -Eq 'cf-ray:|server:[[:space:]]*cloudflare|cf-cache-status:' <<< "$TEXT"; then
+        printf 'Cloudflare'
+    elif grep -Eq 'x-sucuri-id:|x-sucuri-cache:|server:[[:space:]]*sucuri' <<< "$TEXT"; then
+        printf 'Sucuri'
+    elif [[ "$HOST" == *fastly.net ]] || grep -Eq 'server:[[:space:]]*fastly|x-served-by:.*cache-|x-cache-hits:|fastly' <<< "$TEXT"; then
+        printf 'Fastly'
+    elif [[ "$HOST" == *akamaized.net || "$HOST" == *akamai.net || "$HOST" == *edgekey.net || "$HOST" == *edgesuite.net ]] || grep -Eq 'x-akamai-|akamai-grn|akamai-ghost' <<< "$TEXT"; then
+        printf 'Akamai'
+    elif [[ "$HOST" == *b-cdn.net || "$HOST" == *bunnycdn.com ]] || grep -Eq 'server:[[:space:]]*bunnycdn|cdn-pullzone|bunnycdn' <<< "$TEXT"; then
+        printf 'Bunny CDN'
+    elif [[ "$HOST" == *cloudinary.com ]] || grep -Eq 'x-cld-|server:[[:space:]]*cloudinary' <<< "$TEXT"; then
+        printf 'Cloudinary'
+    elif [[ "$HOST" == *imgix.net ]] || grep -Eq 'x-imgix-id:|server:[[:space:]]*imgix' <<< "$TEXT"; then
+        printf 'Imgix'
+    elif [[ "$HOST" == *keycdn.com || "$HOST" == *kxcdn.com ]] || grep -Eq 'server:[[:space:]]*keycdn|x-edge-location:' <<< "$TEXT"; then
+        printf 'KeyCDN'
+    elif [[ "$HOST" == *cdn77.org || "$HOST" == *cdn77.com ]] || grep -Eq 'server:[[:space:]]*cdn77|x-77-' <<< "$TEXT"; then
+        printf 'CDN77'
+    elif [[ "$HOST" == *jsdelivr.net ]]; then
+        printf 'jsDelivr'
+    elif [[ "$HOST" == unpkg.com ]]; then
+        printf 'UNPKG'
+    elif grep -Eq '^x-cache:|^age:|^via:.*varnish|^x-varnish:' <<< "$TEXT"; then
+        printf 'CDN/cache proxy (provider non identificato)'
+    fi
+}
+
+asset_cache_status() {
+    local HEADERS="$1" VALUE
+    VALUE="$(grep -Ei '^(cf-cache-status|x-cache|x-sucuri-cache|x-cache-hits|age):' "$HEADERS" 2>/dev/null | tail -3 | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+    [ -n "$VALUE" ] && printf '%s' "$VALUE"
+}
+
+extract_asset_urls() {
+    local TYPE="$1" HTML="$2" PAGE_URL="$3" OUT="$4" RAW SRC URL
+    : > "$OUT"
+
+    if [ "$TYPE" = "js" ]; then
+        while IFS= read -r RAW; do
+            SRC="$(printf '%s' "$RAW" | sed -E "s/.*src=[\"']([^\"']+)[\"'].*/\1/")"
+            URL="$(resolve_asset_url "$SRC" "$PAGE_URL" || true)"
+            [ -n "$URL" ] && printf '%s\n' "$URL" >> "$OUT"
+        done < <(grep -Eio "<script[^>]+src=[\"'][^\"']+[\"']" "$HTML" 2>/dev/null || true)
+    else
+        while IFS= read -r RAW; do
+            SRC="$(printf '%s' "$RAW" | sed -E "s/.*(src|data-src)=[\"']([^\"']+)[\"'].*/\2/")"
+            URL="$(resolve_asset_url "$SRC" "$PAGE_URL" || true)"
+            [ -n "$URL" ] && printf '%s\n' "$URL" >> "$OUT"
+        done < <(grep -Eio "<img[^>]+(src|data-src)=[\"'][^\"']+[\"']" "$HTML" 2>/dev/null || true)
+    fi
+
+    sort -u "$OUT" -o "$OUT"
+}
+
+probe_asset_cdn_type() {
+    local TYPE="$1" LIST="$2" MAX="${3:-6}"
+    local URL HOST HEADERS PROVIDER CACHE COUNT=0 TOTAL=0 FOUND=0 RC
+    local PROVIDERS="$TMPDIR/${TYPE}-cdn-providers.txt"
+    local HOSTS="$TMPDIR/${TYPE}-asset-hosts.txt"
+    local HOST_LIST PROVIDER_LIST
+
+    : > "$PROVIDERS"
+    : > "$HOSTS"
+    TOTAL="$(wc -l < "$LIST" | tr -d ' ')"
+
+    if [ "$TOTAL" -eq 0 ]; then
+        print_line "[INFO] ${TYPE^^} assets" "nessun asset rilevato nella homepage"
+        [ "$TYPE" = "js" ] && JS_CDN_RESULT="nessun asset rilevato"
+        [ "$TYPE" = "img" ] && IMG_CDN_RESULT="nessun asset rilevato"
+        return 0
+    fi
+
+    while IFS= read -r URL; do
+        [ -n "$URL" ] || continue
+        HOST="$(asset_host "$URL")"
+        [ -n "$HOST" ] || continue
+        printf '%s\n' "$HOST" >> "$HOSTS"
+
+        HEADERS="$TMPDIR/${TYPE}-asset-${COUNT}.headers"
+        set +e
+        curl -ksSIL --max-redirs 5 --connect-timeout 5 --max-time 12 \
+            -A 'SiteSmuggler-MagentoStatus/1.3' \
+            -D "$HEADERS" -o /dev/null "$URL" 2>/dev/null
+        RC=$?
+        set -e
+        if [ "$RC" -ne 0 ] || [ ! -s "$HEADERS" ]; then
+            : > "$HEADERS"
+            curl -ksSL --range 0-0 --max-redirs 5 --connect-timeout 5 --max-time 12 \
+                -A 'SiteSmuggler-MagentoStatus/1.3' \
+                -D "$HEADERS" -o /dev/null "$URL" 2>/dev/null || true
+        fi
+
+        PROVIDER="$(cdn_provider_from_host_headers "$HOST" "$HEADERS" || true)"
+        CACHE="$(asset_cache_status "$HEADERS" || true)"
+
+        if [ -n "$PROVIDER" ]; then
+            FOUND=$((FOUND + 1))
+            printf '%s\n' "$PROVIDER" >> "$PROVIDERS"
+            if [ -n "$CACHE" ]; then
+                print_line "[CDN]  ${TYPE^^} asset" "$PROVIDER | $HOST | $CACHE"
+            else
+                print_line "[CDN]  ${TYPE^^} asset" "$PROVIDER | $HOST"
+            fi
+        else
+            print_line "[INFO] ${TYPE^^} asset" "host=$HOST | CDN non identificata"
+        fi
+
+        COUNT=$((COUNT + 1))
+        [ "$COUNT" -ge "$MAX" ] && break
+    done < "$LIST"
+
+    sort -u "$HOSTS" -o "$HOSTS"
+    sort -u "$PROVIDERS" -o "$PROVIDERS"
+
+    HOST_LIST="$(paste -sd ',' "$HOSTS" 2>/dev/null | sed 's/,/, /g')"
+    PROVIDER_LIST="$(paste -sd ',' "$PROVIDERS" 2>/dev/null | sed 's/,/, /g')"
+
+    print_line "[INFO] ${TYPE^^} asset URLs" "$TOTAL rilevati; $COUNT verificati"
+    print_line "[INFO] ${TYPE^^} asset hosts" "${HOST_LIST:-n/d}"
+
+    if [ "$FOUND" -gt 0 ]; then
+        print_line "[RESULT] ${TYPE^^} CDN" "$PROVIDER_LIST"
+        if [ "$TYPE" = "js" ]; then
+            JS_CDN_RESULT="$PROVIDER_LIST"
+            JS_ASSET_HOSTS="$HOST_LIST"
+        else
+            IMG_CDN_RESULT="$PROVIDER_LIST"
+            IMG_ASSET_HOSTS="$HOST_LIST"
+        fi
+    else
+        print_line "[RESULT] ${TYPE^^} CDN" "non rilevata nei campioni"
+        if [ "$TYPE" = "js" ]; then
+            JS_CDN_RESULT="non rilevata nei campioni"
+            JS_ASSET_HOSTS="$HOST_LIST"
+        else
+            IMG_CDN_RESULT="non rilevata nei campioni"
+            IMG_ASSET_HOSTS="$HOST_LIST"
+        fi
+    fi
 }
 
 if [ -z "$TARGET" ]; then
@@ -436,7 +614,25 @@ fi
 
 echo
 echo "============================================================"
-echo " 3. TTFB BENCHMARK"
+echo " 3. ASSET CDN CHECK - JS / IMAGES"
+echo "============================================================"
+
+ASSET_PAGE_URL="${FINAL_URL:-$BASE_URL/}"
+JS_ASSETS="$TMPDIR/assets-js.txt"
+IMG_ASSETS="$TMPDIR/assets-img.txt"
+extract_asset_urls "js" "$HOME_BODY" "$ASSET_PAGE_URL" "$JS_ASSETS"
+extract_asset_urls "img" "$HOME_BODY" "$ASSET_PAGE_URL" "$IMG_ASSETS"
+
+echo "-- JavaScript --"
+probe_asset_cdn_type "js" "$JS_ASSETS" 6
+
+echo
+echo "-- Immagini --"
+probe_asset_cdn_type "img" "$IMG_ASSETS" 6
+
+echo
+echo "============================================================"
+echo " 4. TTFB BENCHMARK"
 echo "============================================================"
 
 TTFB_URL="${FINAL_URL:-$BASE_URL/}"
@@ -444,7 +640,7 @@ run_ttfb_benchmark "$TTFB_URL" "$TTFB_RUNS"
 
 echo
 echo "============================================================"
-echo " 4. GRAPHQL / STYLESMUGGLER SURFACE"
+echo " 5. GRAPHQL / STYLESMUGGLER SURFACE"
 echo "============================================================"
 echo "Probe innocui: nessun payload PHP/RCE viene inviato."
 echo
@@ -486,12 +682,16 @@ status_route "POST /paypal/transparent/response/" "$CODE"
 
 echo
 echo "============================================================"
-echo " 5. SUMMARY"
+echo " 6. SUMMARY"
 echo "============================================================"
 echo
 [ -n "$WAF_MAIN" ] && echo "WAF/CDN          : $WAF_MAIN" || echo "WAF/CDN          : non identificato"
 [ -n "$MAGENTO_VERSION" ] && echo "Magento version  : $MAGENTO_VERSION ($MAGENTO_VERSION_SOURCE)" || echo "Magento version  : non determinata con affidabilita'"
 echo "Remote IP        : ${REMOTE_IP:-n/d}"
+echo "JS CDN           : $JS_CDN_RESULT"
+echo "Image CDN        : $IMG_CDN_RESULT"
+[ -n "$JS_ASSET_HOSTS" ] && echo "JS hosts         : $JS_ASSET_HOSTS"
+[ -n "$IMG_ASSET_HOSTS" ] && echo "Image hosts      : $IMG_ASSET_HOSTS"
 if [ -n "$TTFB_MEDIAN" ]; then
     echo "TTFB median      : ${TTFB_MEDIAN} ms"
     echo "TTFB average     : ${TTFB_AVERAGE} ms"
@@ -505,6 +705,7 @@ echo
 echo "ACTIVE/REACH = route pubblicamente raggiungibile; NON significa vulnerabile."
 echo "BLOCK/OFF    = route bloccata o non disponibile."
 echo "La stringa /static/versionXXXX e' una firma di deployment/cache, non la versione Magento."
+echo "Asset CDN: il checker verifica host e header CDN/cache su campioni JS e immagini della homepage."
 echo "Il TTFB e' misurato remotamente con cache-buster/no-cache; CDN/WAF e rete incidono sul risultato."
 echo "Il checker e' completamente remoto e non richiede SSH sul server target."
 echo
