@@ -2,7 +2,7 @@
 
 set -u
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 TARGET="${1:-}"
 TMPDIR=""
 BASE_URL=""
@@ -14,6 +14,12 @@ WAF_MAIN=""
 MAGENTO_DETECTED=0
 MAGENTO_VERSION=""
 MAGENTO_VERSION_SOURCE=""
+TTFB_MEDIAN=""
+TTFB_AVERAGE=""
+TTFB_MIN=""
+TTFB_MAX=""
+TTFB_VALID=0
+TTFB_RUNS=10
 
 cleanup() {
     [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"
@@ -43,6 +49,7 @@ normalize_target() {
     else
         BASE_URL="https://$TARGET"
     fi
+
     DOMAIN="${BASE_URL#https://}"
     DOMAIN="${DOMAIN#http://}"
     DOMAIN="${DOMAIN%%/*}"
@@ -55,12 +62,13 @@ public_get() {
     local URL="$1" BODY="$2" HEADERS="$3" META RC
     set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.1' \
+        -A 'SiteSmuggler-MagentoStatus/1.2' \
         -D "$HEADERS" -o "$BODY" \
         -w '%{http_code}|%{url_effective}|%{remote_ip}' \
         "$URL" 2>/dev/null)"
     RC=$?
     set -e
+
     if [ "$RC" -ne 0 ]; then
         printf '000||'
     else
@@ -72,7 +80,7 @@ public_post_json() {
     local URL="$1" JSON="$2" BODY="$3" HEADERS="$4" META RC
     set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.1' \
+        -A 'SiteSmuggler-MagentoStatus/1.2' \
         -X POST -H 'Content-Type: application/json' \
         --data "$JSON" \
         -D "$HEADERS" -o "$BODY" \
@@ -80,6 +88,7 @@ public_post_json() {
         "$URL" 2>/dev/null)"
     RC=$?
     set -e
+
     if [ "$RC" -ne 0 ]; then
         printf '000||'
     else
@@ -91,7 +100,7 @@ public_post_form() {
     local URL="$1" BODY="$2" HEADERS="$3" META RC
     set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.1' \
+        -A 'SiteSmuggler-MagentoStatus/1.2' \
         -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
         --data 'sitesmuggler_probe=1' \
         -D "$HEADERS" -o "$BODY" \
@@ -99,6 +108,7 @@ public_post_form() {
         "$URL" 2>/dev/null)"
     RC=$?
     set -e
+
     if [ "$RC" -ne 0 ]; then
         printf '000||'
     else
@@ -159,6 +169,7 @@ detect_waf() {
 detect_magento_markers() {
     local FILE="$1"
     [ -s "$FILE" ] || return 1
+
     if grep -Eqi 'Magento_[A-Za-z]+|/static/(version[^/]+/)?frontend/|mage/requirejs|requirejs/require\.js|x-magento-init|Magento_Ui' "$FILE"; then
         MAGENTO_DETECTED=1
         return 0
@@ -167,16 +178,25 @@ detect_magento_markers() {
 }
 
 scan_home_js_for_version() {
-    local HOME="$1" HOME_URL="$2" OUT="$3" COUNT=0 SRC JSURL JSFILE VER
+    local HOME="$1" HOME_URL="$2" OUT="$3"
+    local COUNT=0 SRC JSURL JSFILE VER SCHEME
+
     : > "$OUT"
     [ -s "$HOME" ] || return 1
 
+    SCHEME="${HOME_URL%%:*}"
+    case "$SCHEME" in
+        http|https) ;;
+        *) SCHEME="https" ;;
+    esac
+
     while IFS= read -r SRC; do
         [ -n "$SRC" ] || continue
+
         case "$SRC" in
-            //*) JSURL="https:$SRC" ;;
+            //*) JSURL="${SCHEME}:$SRC" ;;
             http://*|https://*) JSURL="$SRC" ;;
-            /*) JSURL="${HOME_URL%%://*}://$DOMAIN$SRC" ;;
+            /*) JSURL="${SCHEME}://${DOMAIN}${SRC}" ;;
             *) JSURL="${HOME_URL%/*}/$SRC" ;;
         esac
 
@@ -186,7 +206,8 @@ scan_home_js_for_version() {
         esac
 
         JSFILE="$TMPDIR/js-$COUNT"
-        curl -ksSL --connect-timeout 5 --max-time 10 -A 'SiteSmuggler-MagentoStatus/1.1' \
+        curl -ksSL --connect-timeout 5 --max-time 10 \
+            -A 'SiteSmuggler-MagentoStatus/1.2' \
             -o "$JSFILE" "$JSURL" 2>/dev/null || true
 
         if [ -s "$JSFILE" ]; then
@@ -206,6 +227,89 @@ scan_home_js_for_version() {
     [ -n "$VER" ] && printf '%s' "$VER"
 }
 
+ms_from_seconds() {
+    awk -v s="$1" 'BEGIN { printf "%.0f", s * 1000 }'
+}
+
+run_ttfb_benchmark() {
+    local URL="$1" RUNS="${2:-10}"
+    local DATA="$TMPDIR/ttfb.tsv"
+    local VALUES="$TMPDIR/ttfb-values.txt"
+    local I SEP TEST_URL RESULT RC CODE DNS CONNECT TLS TTFB TOTAL
+    local TTFB_MS TOTAL_MS DNS_MS CONNECT_MS TLS_MS
+    local AVG_DNS AVG_CONNECT AVG_TLS AVG_TOTAL
+
+    : > "$DATA"
+    : > "$VALUES"
+
+    echo "Target benchmark: $URL"
+    echo "Metodo          : $RUNS richieste HTTPS, redirect seguiti, cache-buster + no-cache"
+    echo
+
+    for ((I=1; I<=RUNS; I++)); do
+        SEP='?'
+        [[ "$URL" == *\?* ]] && SEP='&'
+        TEST_URL="${URL}${SEP}sitesmuggler_ttfb=$(date +%s%N)-${I}"
+
+        set +e
+        RESULT="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 30 \
+            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+            -H 'Cache-Control: no-cache' \
+            -H 'Pragma: no-cache' \
+            -o /dev/null \
+            -w '%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}' \
+            "$TEST_URL" 2>/dev/null)"
+        RC=$?
+        set -e
+
+        if [ "$RC" -ne 0 ] || [ -z "$RESULT" ]; then
+            printf 'TEST %02d | HTTP=000 | errore connessione\n' "$I"
+            continue
+        fi
+
+        IFS='|' read -r CODE DNS CONNECT TLS TTFB TOTAL <<< "$RESULT"
+        TTFB_MS="$(ms_from_seconds "${TTFB:-0}")"
+        TOTAL_MS="$(ms_from_seconds "${TOTAL:-0}")"
+        DNS_MS="$(ms_from_seconds "${DNS:-0}")"
+        CONNECT_MS="$(ms_from_seconds "${CONNECT:-0}")"
+        TLS_MS="$(ms_from_seconds "${TLS:-0}")"
+
+        printf 'TEST %02d | HTTP=%s | TTFB=%4s ms | TOTAL=%4s ms\n' "$I" "$CODE" "$TTFB_MS" "$TOTAL_MS"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$CODE" "$DNS_MS" "$CONNECT_MS" "$TLS_MS" "$TTFB_MS" "$TOTAL_MS" >> "$DATA"
+
+        case "$CODE" in
+            2??|3??)
+                [ "$TTFB_MS" -gt 0 ] 2>/dev/null && printf '%s\n' "$TTFB_MS" >> "$VALUES"
+                ;;
+        esac
+    done
+
+    TTFB_VALID="$(wc -l < "$VALUES" | tr -d ' ')"
+
+    echo
+    if [ "$TTFB_VALID" -eq 0 ]; then
+        print_line "[WARN] TTFB benchmark" "nessuna richiesta HTTP 2xx/3xx valida"
+        return 0
+    fi
+
+    TTFB_AVERAGE="$(awk '{s+=$1} END {if (NR) printf "%.0f", s/NR}' "$VALUES")"
+    TTFB_MIN="$(sort -n "$VALUES" | head -1)"
+    TTFB_MAX="$(sort -n "$VALUES" | tail -1)"
+    TTFB_MEDIAN="$(sort -n "$VALUES" | awk '{a[NR]=$1} END {if (NR%2) printf "%.0f", a[(NR+1)/2]; else printf "%.0f", (a[NR/2]+a[NR/2+1])/2}')"
+
+    AVG_DNS="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$2;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
+    AVG_CONNECT="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$3;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
+    AVG_TLS="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$4;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
+    AVG_TOTAL="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$6;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
+
+    print_line "[RESULT] TTFB median" "${TTFB_MEDIAN} ms"
+    print_line "[RESULT] TTFB average" "${TTFB_AVERAGE} ms"
+    print_line "[INFO] TTFB min / max" "${TTFB_MIN} ms / ${TTFB_MAX} ms"
+    print_line "[INFO] Valid runs" "${TTFB_VALID}/${RUNS}"
+    print_line "[INFO] Avg DNS / CONNECT / TLS" "${AVG_DNS:-n/d} / ${AVG_CONNECT:-n/d} / ${AVG_TLS:-n/d} ms"
+    print_line "[INFO] Avg total response" "${AVG_TOTAL:-n/d} ms"
+}
+
 if [ -z "$TARGET" ]; then
     clear
     echo "============================================================"
@@ -223,6 +327,11 @@ if [ -z "$DOMAIN" ] || [[ "$DOMAIN" != *.* ]]; then
     echo "[ERROR] Dominio non valido: $DOMAIN"
     exit 1
 fi
+
+command -v curl >/dev/null 2>&1 || {
+    echo "[ERROR] curl non trovato"
+    exit 1
+}
 
 TMPDIR="$(mktemp -d /tmp/checkMagentoStatus.XXXXXX)"
 
@@ -327,7 +436,15 @@ fi
 
 echo
 echo "============================================================"
-echo " 3. GRAPHQL / STYLESMUGGLER SURFACE"
+echo " 3. TTFB BENCHMARK"
+echo "============================================================"
+
+TTFB_URL="${FINAL_URL:-$BASE_URL/}"
+run_ttfb_benchmark "$TTFB_URL" "$TTFB_RUNS"
+
+echo
+echo "============================================================"
+echo " 4. GRAPHQL / STYLESMUGGLER SURFACE"
 echo "============================================================"
 echo "Probe innocui: nessun payload PHP/RCE viene inviato."
 echo
@@ -369,15 +486,25 @@ status_route "POST /paypal/transparent/response/" "$CODE"
 
 echo
 echo "============================================================"
-echo " 4. SUMMARY"
+echo " 5. SUMMARY"
 echo "============================================================"
 echo
 [ -n "$WAF_MAIN" ] && echo "WAF/CDN          : $WAF_MAIN" || echo "WAF/CDN          : non identificato"
 [ -n "$MAGENTO_VERSION" ] && echo "Magento version  : $MAGENTO_VERSION ($MAGENTO_VERSION_SOURCE)" || echo "Magento version  : non determinata con affidabilita'"
 echo "Remote IP        : ${REMOTE_IP:-n/d}"
+if [ -n "$TTFB_MEDIAN" ]; then
+    echo "TTFB median      : ${TTFB_MEDIAN} ms"
+    echo "TTFB average     : ${TTFB_AVERAGE} ms"
+    echo "TTFB min / max   : ${TTFB_MIN} / ${TTFB_MAX} ms"
+    echo "TTFB valid runs  : ${TTFB_VALID}/${TTFB_RUNS}"
+else
+    echo "TTFB             : non determinato"
+fi
+
 echo
 echo "ACTIVE/REACH = route pubblicamente raggiungibile; NON significa vulnerabile."
 echo "BLOCK/OFF    = route bloccata o non disponibile."
 echo "La stringa /static/versionXXXX e' una firma di deployment/cache, non la versione Magento."
+echo "Il TTFB e' misurato remotamente con cache-buster/no-cache; CDN/WAF e rete incidono sul risultato."
 echo "Il checker e' completamente remoto e non richiede SSH sul server target."
 echo
