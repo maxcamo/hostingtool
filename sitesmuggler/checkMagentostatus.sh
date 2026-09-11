@@ -2,7 +2,7 @@
 
 set -u
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 TARGET="${1:-}"
 TMPDIR=""
 BASE_URL=""
@@ -496,7 +496,7 @@ if [ -z "$TARGET" ]; then
     echo " Version $VERSION"
     echo "============================================================"
     echo
-    read -r -p "URL o dominio Magento: " TARGET
+    read -r -p "Dominio Magento (es. brixiamoto.com): " TARGET
 fi
 
 normalize_target
