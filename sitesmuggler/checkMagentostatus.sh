@@ -2,7 +2,7 @@
 
 set -u
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 TARGET="${1:-}"
 TMPDIR=""
 BASE_URL=""
@@ -15,6 +15,8 @@ MAGENTO_DETECTED=0
 MAGENTO_VERSION=""
 MAGENTO_VERSION_SOURCE=""
 MAGENTO_VERSION_PUBLIC=0
+MAGENTO_EDITION=""
+ELASTICSUITE_VERSION=""
 AMASTY_DETECTED=0
 AMASTY_FINGERPRINTS=""
 TTFB_MEDIAN=""
@@ -33,7 +35,7 @@ IMG_CDN_RESULT="non determinata"
 JS_ASSET_HOSTS=""
 IMG_ASSET_HOSTS=""
 
-UA_STATUS="SiteSmuggler-MagentoStatus/1.5"
+UA_STATUS="SiteSmuggler-MagentoStatus/1.5.1"
 UA_BROWSER="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
 cleanup() {
@@ -148,17 +150,27 @@ meta_code() { printf '%s' "$1" | cut -d'|' -f1; }
 meta_url()  { printf '%s' "$1" | cut -d'|' -f2; }
 meta_ip()   { printf '%s' "$1" | cut -d'|' -f3; }
 
-extract_any_version() {
-    local FILE="$1"
-    [ -s "$FILE" ] || return 1
-    grep -Eio '2\.[0-9]+\.[0-9]+(-p[0-9]+)?' "$FILE" 2>/dev/null | head -1
-}
-
 extract_magento_version() {
     local FILE="$1"
     [ -s "$FILE" ] || return 1
-    grep -Eio 'Magento[^[:cntrl:]]{0,120}2\.[0-9]+\.[0-9]+(-p[0-9]+)?|2\.[0-9]+\.[0-9]+(-p[0-9]+)?[^[:cntrl:]]{0,120}Magento' "$FILE" 2>/dev/null \
-        | grep -Eo '2\.[0-9]+\.[0-9]+(-p[0-9]+)?' \
+    grep -Eio 'Magento[[:space:]/_-]*2\.[0-9]+(\.[0-9]+)?(-p[0-9]+)?' "$FILE" 2>/dev/null \
+        | sed -E 's/.*(2\.[0-9]+(\.[0-9]+)?(-p[0-9]+)?).*/\1/' \
+        | head -1
+}
+
+extract_magento_edition() {
+    local FILE="$1"
+    [ -s "$FILE" ] || return 1
+    grep -Eio 'Magento[[:space:]/_-]*2\.[0-9]+(\.[0-9]+)?(-p[0-9]+)?[[:space:]]*\((Community|Commerce|Enterprise)\)' "$FILE" 2>/dev/null \
+        | grep -Eio 'Community|Commerce|Enterprise' \
+        | head -1
+}
+
+extract_elasticsuite_version() {
+    local FILE="$1"
+    [ -s "$FILE" ] || return 1
+    grep -Eio 'Elasticsuite[[:space:]/_-]*[0-9]+\.[0-9]+\.[0-9]+' "$FILE" 2>/dev/null \
+        | sed -E 's/.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+).*/\1/' \
         | head -1
 }
 
@@ -275,7 +287,7 @@ scan_home_js_for_version() {
             -o "$JSFILE" "$JSURL" 2>/dev/null || true
 
         if [ -s "$JSFILE" ]; then
-            grep -Eio 'Magento[^[:cntrl:]]{0,100}2\.[0-9]+\.[0-9]+(-p[0-9]+)?|2\.[0-9]+\.[0-9]+(-p[0-9]+)?[^[:cntrl:]]{0,100}Magento' "$JSFILE" 2>/dev/null \
+            grep -Eio 'Magento[[:space:]/_-]*2\.[0-9]+(\.[0-9]+)?(-p[0-9]+)?' "$JSFILE" 2>/dev/null \
                 | head -3 >> "$OUT" || true
         fi
 
@@ -590,17 +602,19 @@ asset_cache_status() {
 
 probe_asset_cdn_type() {
     local TYPE="$1" LIST="$2" MAX="${3:-6}"
-    local URL HOST HEADERS PROVIDER CACHE COUNT=0 TOTAL=0 FOUND=0 RC
+    local TYPE_LABEL URL HOST HEADERS PROVIDER CACHE COUNT=0 TOTAL=0 FOUND=0 RC
     local PROVIDERS="$TMPDIR/${TYPE}-cdn-providers.txt"
     local HOSTS="$TMPDIR/${TYPE}-asset-hosts.txt"
     local HOST_LIST PROVIDER_LIST
+
+    TYPE_LABEL="$(printf '%s' "$TYPE" | tr '[:lower:]' '[:upper:]')"
 
     : > "$PROVIDERS"
     : > "$HOSTS"
     TOTAL="$(wc -l < "$LIST" | tr -d ' ')"
 
     if [ "$TOTAL" -eq 0 ]; then
-        print_line "[INFO] ${TYPE^^} assets" "nessun asset rilevato nella homepage"
+        print_line "[INFO] ${TYPE_LABEL} assets" "nessun asset rilevato nella homepage"
         [ "$TYPE" = "js" ] && JS_CDN_RESULT="nessun asset rilevato"
         [ "$TYPE" = "img" ] && IMG_CDN_RESULT="nessun asset rilevato"
         return 0
@@ -631,12 +645,12 @@ probe_asset_cdn_type() {
             FOUND=$((FOUND + 1))
             printf '%s\n' "$PROVIDER" >> "$PROVIDERS"
             if [ -n "$CACHE" ]; then
-                print_line "[CDN]  ${TYPE^^} asset" "$PROVIDER | $HOST | $CACHE"
+                print_line "[CDN]  ${TYPE_LABEL} asset" "$PROVIDER | $HOST | $CACHE"
             else
-                print_line "[CDN]  ${TYPE^^} asset" "$PROVIDER | $HOST"
+                print_line "[CDN]  ${TYPE_LABEL} asset" "$PROVIDER | $HOST"
             fi
         else
-            print_line "[INFO] ${TYPE^^} asset" "host=$HOST | CDN non identificata"
+            print_line "[INFO] ${TYPE_LABEL} asset" "host=$HOST | CDN non identificata"
         fi
 
         COUNT=$((COUNT + 1))
@@ -649,11 +663,11 @@ probe_asset_cdn_type() {
     HOST_LIST="$(paste -sd ',' "$HOSTS" 2>/dev/null | sed 's/,/, /g')"
     PROVIDER_LIST="$(paste -sd ',' "$PROVIDERS" 2>/dev/null | sed 's/,/, /g')"
 
-    print_line "[INFO] ${TYPE^^} asset URLs" "$TOTAL rilevati; $COUNT verificati"
-    print_line "[INFO] ${TYPE^^} asset hosts" "${HOST_LIST:-n/d}"
+    print_line "[INFO] ${TYPE_LABEL} asset URLs" "$TOTAL rilevati; $COUNT verificati"
+    print_line "[INFO] ${TYPE_LABEL} asset hosts" "${HOST_LIST:-n/d}"
 
     if [ "$FOUND" -gt 0 ]; then
-        print_line "[RESULT] ${TYPE^^} CDN" "$PROVIDER_LIST"
+        print_line "[RESULT] ${TYPE_LABEL} CDN" "$PROVIDER_LIST"
         if [ "$TYPE" = "js" ]; then
             JS_CDN_RESULT="$PROVIDER_LIST"
             JS_ASSET_HOSTS="$HOST_LIST"
@@ -662,7 +676,7 @@ probe_asset_cdn_type() {
             IMG_ASSET_HOSTS="$HOST_LIST"
         fi
     else
-        print_line "[RESULT] ${TYPE^^} CDN" "non rilevata nei campioni"
+        print_line "[RESULT] ${TYPE_LABEL} CDN" "non rilevata nei campioni"
         if [ "$TYPE" = "js" ]; then
             JS_CDN_RESULT="non rilevata nei campioni"
             JS_ASSET_HOSTS="$HOST_LIST"
@@ -745,16 +759,28 @@ MV_BODY="$TMPDIR/magento_version.body"
 MV_HEADERS="$TMPDIR/magento_version.headers"
 META="$(public_get "${BASE_URL}/magento_version" "$MV_BODY" "$MV_HEADERS")"
 MV_CODE="$(meta_code "$META")"
-VER="$(extract_any_version "$MV_BODY" || true)"
+VER="$(extract_magento_version "$MV_BODY" || true)"
+EDITION="$(extract_magento_edition "$MV_BODY" || true)"
+ELASTIC="$(extract_elasticsuite_version "$MV_BODY" || true)"
 
 if [ "$MV_CODE" = "200" ]; then
     MAGENTO_VERSION_PUBLIC=1
     print_line "[WARN] /magento_version" "HTTP 200 - endpoint pubblico: DA RIMUOVERE / VERIFICARE"
     if [ -n "$VER" ]; then
-        print_line "[LEAK] Versione Magento esposta" "$VER"
+        if [ -n "$EDITION" ]; then
+            MAGENTO_EDITION="$EDITION"
+            print_line "[LEAK] Versione Magento esposta" "$VER ($EDITION)"
+        else
+            print_line "[LEAK] Versione Magento esposta" "$VER"
+        fi
         set_version_if_empty "$VER" "/magento_version"
     else
         print_line "[WARN] Information disclosure" "/magento_version pubblicamente raggiungibile"
+    fi
+
+    if [ -n "$ELASTIC" ]; then
+        ELASTICSUITE_VERSION="$ELASTIC"
+        print_line "[INFO] ElasticSuite version" "$ELASTIC"
     fi
 else
     status_route "/magento_version" "$MV_CODE"
@@ -890,6 +916,8 @@ echo "============================================================"
 echo
 [ -n "$WAF_MAIN" ] && echo "WAF/CDN          : $WAF_MAIN" || echo "WAF/CDN          : non identificato"
 [ -n "$MAGENTO_VERSION" ] && echo "Magento version  : $MAGENTO_VERSION ($MAGENTO_VERSION_SOURCE)" || echo "Magento version  : non determinata con affidabilita'"
+[ -n "$MAGENTO_EDITION" ] && echo "Magento edition  : $MAGENTO_EDITION"
+[ -n "$ELASTICSUITE_VERSION" ] && echo "ElasticSuite     : $ELASTICSUITE_VERSION"
 if [ "$MAGENTO_VERSION_PUBLIC" -eq 1 ]; then
     echo "magento_version  : HTTP 200 - DA RIMUOVERE / VERIFICARE"
 else
@@ -927,6 +955,7 @@ echo
 echo "ACTIVE/REACH = route pubblicamente raggiungibile; NON significa vulnerabile."
 echo "BLOCK/OFF    = route bloccata o non disponibile."
 echo "/magento_version HTTP 200 = endpoint pubblico da rimuovere/verificare con il cliente."
+echo "Version parser: legge solo la versione associata direttamente a Magento; versioni di ElasticSuite o altri moduli sono separate."
 echo "Amasty: il fingerprint remoto puo' rilevare riferimenti pubblici, ma non prova assenza/presenza completa ne' la versione installata."
 echo "La stringa /static/versionXXXX e' una firma di deployment/cache, non la versione Magento."
 echo "Asset CDN: il checker verifica host e header CDN/cache su campioni JS e immagini della homepage."
