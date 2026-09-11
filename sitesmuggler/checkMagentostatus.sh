@@ -2,7 +2,7 @@
 
 set -u
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 TARGET="${1:-}"
 TMPDIR=""
 BASE_URL=""
@@ -19,6 +19,11 @@ TTFB_AVERAGE=""
 TTFB_MIN=""
 TTFB_MAX=""
 TTFB_VALID=0
+TTFB_CACHED_MEDIAN=""
+TTFB_CACHED_AVERAGE=""
+TTFB_CACHED_MIN=""
+TTFB_CACHED_MAX=""
+TTFB_CACHED_VALID=0
 TTFB_RUNS=10
 JS_CDN_RESULT="non determinata"
 IMG_CDN_RESULT="non determinata"
@@ -66,7 +71,7 @@ public_get() {
     local URL="$1" BODY="$2" HEADERS="$3" META RC
     set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.3' \
+        -A 'SiteSmuggler-MagentoStatus/1.4' \
         -D "$HEADERS" -o "$BODY" \
         -w '%{http_code}|%{url_effective}|%{remote_ip}' \
         "$URL" 2>/dev/null)"
@@ -84,7 +89,7 @@ public_post_json() {
     local URL="$1" JSON="$2" BODY="$3" HEADERS="$4" META RC
     set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.3' \
+        -A 'SiteSmuggler-MagentoStatus/1.4' \
         -X POST -H 'Content-Type: application/json' \
         --data "$JSON" \
         -D "$HEADERS" -o "$BODY" \
@@ -104,7 +109,7 @@ public_post_form() {
     local URL="$1" BODY="$2" HEADERS="$3" META RC
     set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.3' \
+        -A 'SiteSmuggler-MagentoStatus/1.4' \
         -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
         --data 'sitesmuggler_probe=1' \
         -D "$HEADERS" -o "$BODY" \
@@ -211,7 +216,7 @@ scan_home_js_for_version() {
 
         JSFILE="$TMPDIR/js-$COUNT"
         curl -ksSL --connect-timeout 5 --max-time 10 \
-            -A 'SiteSmuggler-MagentoStatus/1.3' \
+            -A 'SiteSmuggler-MagentoStatus/1.4' \
             -o "$JSFILE" "$JSURL" 2>/dev/null || true
 
         if [ -s "$JSFILE" ]; then
@@ -233,6 +238,15 @@ scan_home_js_for_version() {
 
 ms_from_seconds() {
     awk -v s="$1" 'BEGIN { printf "%.0f", s * 1000 }'
+}
+
+cache_headers_summary() {
+    local HEADERS="$1" VALUE
+    VALUE="$(grep -Ei '^(x-magento-cache-debug|x-cache|x-cache-hits|cf-cache-status|x-sucuri-cache|age|x-varnish):' "$HEADERS" 2>/dev/null \
+        | tail -8 \
+        | tr '\n' '|' \
+        | sed -E 's/[[:space:]]+/ /g; s/\|$//')"
+    [ -n "$VALUE" ] && printf '%s' "$VALUE"
 }
 
 run_ttfb_benchmark() {
@@ -306,12 +320,115 @@ run_ttfb_benchmark() {
     AVG_TLS="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$4;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
     AVG_TOTAL="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$6;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
 
-    print_line "[RESULT] TTFB median" "${TTFB_MEDIAN} ms"
-    print_line "[RESULT] TTFB average" "${TTFB_AVERAGE} ms"
-    print_line "[INFO] TTFB min / max" "${TTFB_MIN} ms / ${TTFB_MAX} ms"
-    print_line "[INFO] Valid runs" "${TTFB_VALID}/${RUNS}"
+    print_line "[RESULT] No-cache TTFB median" "${TTFB_MEDIAN} ms"
+    print_line "[RESULT] No-cache TTFB average" "${TTFB_AVERAGE} ms"
+    print_line "[INFO] No-cache TTFB min / max" "${TTFB_MIN} ms / ${TTFB_MAX} ms"
+    print_line "[INFO] No-cache valid runs" "${TTFB_VALID}/${RUNS}"
     print_line "[INFO] Avg DNS / CONNECT / TLS" "${AVG_DNS:-n/d} / ${AVG_CONNECT:-n/d} / ${AVG_TLS:-n/d} ms"
     print_line "[INFO] Avg total response" "${AVG_TOTAL:-n/d} ms"
+}
+
+run_ttfb_cached_benchmark() {
+    local URL="$1" RUNS="${2:-10}"
+    local DATA="$TMPDIR/ttfb-cached.tsv"
+    local VALUES="$TMPDIR/ttfb-cached-values.txt"
+    local I RESULT RC CODE DNS CONNECT TLS TTFB TOTAL
+    local TTFB_MS TOTAL_MS DNS_MS CONNECT_MS TLS_MS
+    local AVG_DNS AVG_CONNECT AVG_TLS AVG_TOTAL
+    local HEADERS CACHE_INFO WARM_HEADERS WARM_RESULT WARM_CODE WARM_TTFB WARM_TOTAL
+
+    : > "$DATA"
+    : > "$VALUES"
+
+    echo "Target benchmark: $URL"
+    echo "Metodo          : 1 warm-up + $RUNS richieste allo stesso URL, cache consentita"
+    echo
+
+    WARM_HEADERS="$TMPDIR/ttfb-cached-warm.headers"
+    set +e
+    WARM_RESULT="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 30 \
+        -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+        -D "$WARM_HEADERS" -o /dev/null \
+        -w '%{http_code}|%{time_starttransfer}|%{time_total}' \
+        "$URL" 2>/dev/null)"
+    RC=$?
+    set -e
+
+    if [ "$RC" -eq 0 ] && [ -n "$WARM_RESULT" ]; then
+        IFS='|' read -r WARM_CODE WARM_TTFB WARM_TOTAL <<< "$WARM_RESULT"
+        CACHE_INFO="$(cache_headers_summary "$WARM_HEADERS" || true)"
+        printf 'WARM-UP | HTTP=%s | TTFB=%4s ms | TOTAL=%4s ms' \
+            "$WARM_CODE" "$(ms_from_seconds "${WARM_TTFB:-0}")" "$(ms_from_seconds "${WARM_TOTAL:-0}")"
+        [ -n "$CACHE_INFO" ] && printf ' | CACHE=%s' "$CACHE_INFO"
+        printf '\n'
+    else
+        echo "WARM-UP | HTTP=000 | errore connessione"
+    fi
+
+    echo
+
+    for ((I=1; I<=RUNS; I++)); do
+        HEADERS="$TMPDIR/ttfb-cached-${I}.headers"
+
+        set +e
+        RESULT="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 30 \
+            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+            -D "$HEADERS" -o /dev/null \
+            -w '%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}' \
+            "$URL" 2>/dev/null)"
+        RC=$?
+        set -e
+
+        if [ "$RC" -ne 0 ] || [ -z "$RESULT" ]; then
+            printf 'CACHE %02d | HTTP=000 | errore connessione\n' "$I"
+            continue
+        fi
+
+        IFS='|' read -r CODE DNS CONNECT TLS TTFB TOTAL <<< "$RESULT"
+        TTFB_MS="$(ms_from_seconds "${TTFB:-0}")"
+        TOTAL_MS="$(ms_from_seconds "${TOTAL:-0}")"
+        DNS_MS="$(ms_from_seconds "${DNS:-0}")"
+        CONNECT_MS="$(ms_from_seconds "${CONNECT:-0}")"
+        TLS_MS="$(ms_from_seconds "${TLS:-0}")"
+        CACHE_INFO="$(cache_headers_summary "$HEADERS" || true)"
+
+        printf 'CACHE %02d | HTTP=%s | TTFB=%4s ms | TOTAL=%4s ms' "$I" "$CODE" "$TTFB_MS" "$TOTAL_MS"
+        [ -n "$CACHE_INFO" ] && printf ' | CACHE=%s' "$CACHE_INFO"
+        printf '\n'
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$CODE" "$DNS_MS" "$CONNECT_MS" "$TLS_MS" "$TTFB_MS" "$TOTAL_MS" >> "$DATA"
+
+        case "$CODE" in
+            2??|3??)
+                [ "$TTFB_MS" -gt 0 ] 2>/dev/null && printf '%s\n' "$TTFB_MS" >> "$VALUES"
+                ;;
+        esac
+    done
+
+    TTFB_CACHED_VALID="$(wc -l < "$VALUES" | tr -d ' ')"
+
+    echo
+    if [ "$TTFB_CACHED_VALID" -eq 0 ]; then
+        print_line "[WARN] Cached TTFB benchmark" "nessuna richiesta HTTP 2xx/3xx valida"
+        return 0
+    fi
+
+    TTFB_CACHED_AVERAGE="$(awk '{s+=$1} END {if (NR) printf "%.0f", s/NR}' "$VALUES")"
+    TTFB_CACHED_MIN="$(sort -n "$VALUES" | head -1)"
+    TTFB_CACHED_MAX="$(sort -n "$VALUES" | tail -1)"
+    TTFB_CACHED_MEDIAN="$(sort -n "$VALUES" | awk '{a[NR]=$1} END {if (NR%2) printf "%.0f", a[(NR+1)/2]; else printf "%.0f", (a[NR/2]+a[NR/2+1])/2}')"
+
+    AVG_DNS="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$2;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
+    AVG_CONNECT="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$3;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
+    AVG_TLS="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$4;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
+    AVG_TOTAL="$(awk -F '\t' '$1 ~ /^[23][0-9][0-9]$/ {s+=$6;n++} END {if(n) printf "%.0f", s/n}' "$DATA")"
+
+    print_line "[RESULT] Cached TTFB median" "${TTFB_CACHED_MEDIAN} ms"
+    print_line "[RESULT] Cached TTFB average" "${TTFB_CACHED_AVERAGE} ms"
+    print_line "[INFO] Cached TTFB min / max" "${TTFB_CACHED_MIN} ms / ${TTFB_CACHED_MAX} ms"
+    print_line "[INFO] Cached valid runs" "${TTFB_CACHED_VALID}/${RUNS}"
+    print_line "[INFO] Cached avg DNS / CONNECT / TLS" "${AVG_DNS:-n/d} / ${AVG_CONNECT:-n/d} / ${AVG_TLS:-n/d} ms"
+    print_line "[INFO] Cached avg total response" "${AVG_TOTAL:-n/d} ms"
 }
 
 asset_host() {
@@ -428,14 +545,14 @@ probe_asset_cdn_type() {
         HEADERS="$TMPDIR/${TYPE}-asset-${COUNT}.headers"
         set +e
         curl -ksSIL --max-redirs 5 --connect-timeout 5 --max-time 12 \
-            -A 'SiteSmuggler-MagentoStatus/1.3' \
+            -A 'SiteSmuggler-MagentoStatus/1.4' \
             -D "$HEADERS" -o /dev/null "$URL" 2>/dev/null
         RC=$?
         set -e
         if [ "$RC" -ne 0 ] || [ ! -s "$HEADERS" ]; then
             : > "$HEADERS"
             curl -ksSL --range 0-0 --max-redirs 5 --connect-timeout 5 --max-time 12 \
-                -A 'SiteSmuggler-MagentoStatus/1.3' \
+                -A 'SiteSmuggler-MagentoStatus/1.4' \
                 -D "$HEADERS" -o /dev/null "$URL" 2>/dev/null || true
         fi
 
@@ -636,7 +753,13 @@ echo " 4. TTFB BENCHMARK"
 echo "============================================================"
 
 TTFB_URL="${FINAL_URL:-$BASE_URL/}"
+
+echo "-- NO-CACHE / CACHE-BUSTER --"
 run_ttfb_benchmark "$TTFB_URL" "$TTFB_RUNS"
+
+echo
+echo "-- MAGENTO / CDN WARM CACHE --"
+run_ttfb_cached_benchmark "$TTFB_URL" "$TTFB_RUNS"
 
 echo
 echo "============================================================"
@@ -693,12 +816,20 @@ echo "Image CDN        : $IMG_CDN_RESULT"
 [ -n "$JS_ASSET_HOSTS" ] && echo "JS hosts         : $JS_ASSET_HOSTS"
 [ -n "$IMG_ASSET_HOSTS" ] && echo "Image hosts      : $IMG_ASSET_HOSTS"
 if [ -n "$TTFB_MEDIAN" ]; then
-    echo "TTFB median      : ${TTFB_MEDIAN} ms"
-    echo "TTFB average     : ${TTFB_AVERAGE} ms"
-    echo "TTFB min / max   : ${TTFB_MIN} / ${TTFB_MAX} ms"
-    echo "TTFB valid runs  : ${TTFB_VALID}/${TTFB_RUNS}"
+    echo "TTFB no-cache med: ${TTFB_MEDIAN} ms"
+    echo "TTFB no-cache avg: ${TTFB_AVERAGE} ms"
+    echo "TTFB no-cache rng: ${TTFB_MIN} / ${TTFB_MAX} ms"
+    echo "No-cache runs    : ${TTFB_VALID}/${TTFB_RUNS}"
 else
-    echo "TTFB             : non determinato"
+    echo "TTFB no-cache    : non determinato"
+fi
+if [ -n "$TTFB_CACHED_MEDIAN" ]; then
+    echo "TTFB cached med  : ${TTFB_CACHED_MEDIAN} ms"
+    echo "TTFB cached avg  : ${TTFB_CACHED_AVERAGE} ms"
+    echo "TTFB cached rng  : ${TTFB_CACHED_MIN} / ${TTFB_CACHED_MAX} ms"
+    echo "Cached runs      : ${TTFB_CACHED_VALID}/${TTFB_RUNS}"
+else
+    echo "TTFB cached      : non determinato"
 fi
 
 echo
@@ -706,6 +837,7 @@ echo "ACTIVE/REACH = route pubblicamente raggiungibile; NON significa vulnerabil
 echo "BLOCK/OFF    = route bloccata o non disponibile."
 echo "La stringa /static/versionXXXX e' una firma di deployment/cache, non la versione Magento."
 echo "Asset CDN: il checker verifica host e header CDN/cache su campioni JS e immagini della homepage."
-echo "Il TTFB e' misurato remotamente con cache-buster/no-cache; CDN/WAF e rete incidono sul risultato."
+echo "TTFB no-cache: cache-buster + no-cache. TTFB cached: warm-up e richieste ripetute allo stesso URL con cache consentita."
+echo "Gli header cache mostrati aiutano a distinguere HIT/MISS quando Magento/CDN/WAF li espongono."
 echo "Il checker e' completamente remoto e non richiede SSH sul server target."
 echo
