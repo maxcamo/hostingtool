@@ -2,7 +2,7 @@
 
 set -u
 
-VERSION="1.5.1"
+VERSION="1.6.0"
 TARGET="${1:-}"
 TMPDIR=""
 BASE_URL=""
@@ -12,11 +12,13 @@ REMOTE_IP=""
 WAF=""
 WAF_MAIN=""
 MAGENTO_DETECTED=0
+MAGENTO_FAMILY=""
 MAGENTO_VERSION=""
 MAGENTO_VERSION_SOURCE=""
 MAGENTO_VERSION_PUBLIC=0
 MAGENTO_EDITION=""
 ELASTICSUITE_VERSION=""
+M1_DOWNLOADER_STATUS="non verificato"
 AMASTY_DETECTED=0
 AMASTY_FINGERPRINTS=""
 TTFB_MEDIAN=""
@@ -35,7 +37,7 @@ IMG_CDN_RESULT="non determinata"
 JS_ASSET_HOSTS=""
 IMG_ASSET_HOSTS=""
 
-UA_STATUS="SiteSmuggler-MagentoStatus/1.5.1"
+UA_STATUS="SiteSmuggler-MagentoStatus/1.6"
 UA_BROWSER="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
 cleanup() {
@@ -153,15 +155,15 @@ meta_ip()   { printf '%s' "$1" | cut -d'|' -f3; }
 extract_magento_version() {
     local FILE="$1"
     [ -s "$FILE" ] || return 1
-    grep -Eio 'Magento[[:space:]/_-]*2\.[0-9]+(\.[0-9]+)?(-p[0-9]+)?' "$FILE" 2>/dev/null \
-        | sed -E 's/.*(2\.[0-9]+(\.[0-9]+)?(-p[0-9]+)?).*/\1/' \
+    grep -Eio 'Magento[[:space:]/_-]*[12](\.[0-9]+){1,3}(-p[0-9]+)?' "$FILE" 2>/dev/null \
+        | grep -Eo '[12](\.[0-9]+){1,3}(-p[0-9]+)?' \
         | head -1
 }
 
 extract_magento_edition() {
     local FILE="$1"
     [ -s "$FILE" ] || return 1
-    grep -Eio 'Magento[[:space:]/_-]*2\.[0-9]+(\.[0-9]+)?(-p[0-9]+)?[[:space:]]*\((Community|Commerce|Enterprise)\)' "$FILE" 2>/dev/null \
+    grep -Eio 'Magento[[:space:]/_-]*[12](\.[0-9]+){1,3}(-p[0-9]+)?[[:space:]]*\((Community|Commerce|Enterprise)\)' "$FILE" 2>/dev/null \
         | grep -Eio 'Community|Commerce|Enterprise' \
         | head -1
 }
@@ -174,11 +176,20 @@ extract_elasticsuite_version() {
         | head -1
 }
 
+set_family_from_version() {
+    local VALUE="$1"
+    case "$VALUE" in
+        1.*) MAGENTO_FAMILY="Magento 1"; MAGENTO_DETECTED=1 ;;
+        2.*) MAGENTO_FAMILY="Magento 2"; MAGENTO_DETECTED=1 ;;
+    esac
+}
+
 set_version_if_empty() {
     local VALUE="$1" SOURCE="$2"
     if [ -z "$MAGENTO_VERSION" ] && [ -n "$VALUE" ]; then
         MAGENTO_VERSION="$VALUE"
         MAGENTO_VERSION_SOURCE="$SOURCE"
+        set_family_from_version "$VALUE"
     fi
 }
 
@@ -210,10 +221,46 @@ detect_magento_markers() {
     local FILE="$1"
     [ -s "$FILE" ] || return 1
 
-    if grep -Eqi 'Magento_[A-Za-z]+|/static/(version[^/]+/)?frontend/|mage/requirejs|requirejs/require\.js|x-magento-init|Magento_Ui' "$FILE"; then
+    if grep -Eqi 'Magento_[A-Za-z]+|/static/(version[^/]+/)?frontend/|mage/requirejs|requirejs/require\.js|x-magento-init|Magento_Ui|/customer/section/load' "$FILE"; then
         MAGENTO_DETECTED=1
+        MAGENTO_FAMILY="Magento 2"
         return 0
     fi
+
+    if grep -Eqi '/skin/frontend/|/js/(mage|varien|prototype)/|Mage\.Cookies|VarienForm|new[[:space:]]+Product\.Config|prototype\.js|checkout/cart/add' "$FILE"; then
+        MAGENTO_DETECTED=1
+        MAGENTO_FAMILY="Magento 1"
+        return 0
+    fi
+
+    return 1
+}
+
+fallback_magento1_probe() {
+    [ -n "$MAGENTO_FAMILY" ] && return 0
+
+    local BODY HEAD META CODE
+
+    BODY="$TMPDIR/m1-varien.body"
+    HEAD="$TMPDIR/m1-varien.headers"
+    META="$(public_get "${BASE_URL}/js/varien/form.js" "$BODY" "$HEAD")"
+    CODE="$(meta_code "$META")"
+    if [ "$CODE" = "200" ] && grep -Eqi 'VarienForm|Varien\.Form|Validation' "$BODY" 2>/dev/null; then
+        MAGENTO_DETECTED=1
+        MAGENTO_FAMILY="Magento 1"
+        return 0
+    fi
+
+    BODY="$TMPDIR/m1-cookies.body"
+    HEAD="$TMPDIR/m1-cookies.headers"
+    META="$(public_get "${BASE_URL}/js/mage/cookies.js" "$BODY" "$HEAD")"
+    CODE="$(meta_code "$META")"
+    if [ "$CODE" = "200" ] && grep -Eqi 'Mage\.Cookies|Mage' "$BODY" 2>/dev/null; then
+        MAGENTO_DETECTED=1
+        MAGENTO_FAMILY="Magento 1"
+        return 0
+    fi
+
     return 1
 }
 
@@ -287,7 +334,7 @@ scan_home_js_for_version() {
             -o "$JSFILE" "$JSURL" 2>/dev/null || true
 
         if [ -s "$JSFILE" ]; then
-            grep -Eio 'Magento[[:space:]/_-]*2\.[0-9]+(\.[0-9]+)?(-p[0-9]+)?' "$JSFILE" 2>/dev/null \
+            grep -Eio 'Magento[[:space:]/_-]*[12](\.[0-9]+){1,3}(-p[0-9]+)?' "$JSFILE" 2>/dev/null \
                 | head -3 >> "$OUT" || true
         fi
 
@@ -402,7 +449,7 @@ run_ttfb_benchmark() {
     for ((I=1; I<=RUNS; I++)); do
         SEP='?'
         [[ "$URL" == *\?* ]] && SEP='&'
-        TEST_URL="${URL}${SEP}sitesmuggler_ttfb=$(date +%s%N)-${I}"
+        TEST_URL="${URL}${SEP}sitesmuggler_ttfb=$(date +%s)-$$-${I}"
 
         RESULT="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 30 \
             -A "$UA_BROWSER" \
@@ -691,7 +738,7 @@ if [ -z "$TARGET" ]; then
     clear
     echo "============================================================"
     echo " CHECK MAGENTO STATUS"
-    echo " Remote Magento / StyleSmuggler surface checker"
+    echo " Remote Magento 1/2 / StyleSmuggler surface checker"
     echo " Version $VERSION"
     echo "============================================================"
     echo
@@ -745,9 +792,14 @@ else
 fi
 
 if detect_magento_markers "$HOME_BODY"; then
-    print_line "[PASS] Magento frontend fingerprint" "Magento 2 rilevato"
+    print_line "[PASS] Magento frontend fingerprint" "$MAGENTO_FAMILY rilevato"
 else
-    print_line "[INFO] Magento frontend fingerprint" "non conclusivo"
+    fallback_magento1_probe || true
+    if [ -n "$MAGENTO_FAMILY" ]; then
+        print_line "[PASS] Magento frontend fingerprint" "$MAGENTO_FAMILY rilevato (probe asset)"
+    else
+        print_line "[INFO] Magento frontend fingerprint" "non conclusivo"
+    fi
 fi
 
 echo
@@ -786,16 +838,39 @@ else
     status_route "/magento_version" "$MV_CODE"
 fi
 
-SETUP_BODY="$TMPDIR/setup.body"
-SETUP_HEADERS="$TMPDIR/setup.headers"
-META="$(public_get "${BASE_URL}/setup/" "$SETUP_BODY" "$SETUP_HEADERS")"
-CODE="$(meta_code "$META")"
-VER="$(extract_magento_version "$SETUP_BODY" || true)"
-if [ -n "$VER" ]; then
-    print_line "[LEAK]  /setup/ Magento version" "$VER (HTTP $CODE)"
-    set_version_if_empty "$VER" "/setup/"
+if [ "$MAGENTO_FAMILY" = "Magento 1" ]; then
+    DOWN_BODY="$TMPDIR/downloader.body"
+    DOWN_HEADERS="$TMPDIR/downloader.headers"
+    META="$(public_get "${BASE_URL}/downloader/" "$DOWN_BODY" "$DOWN_HEADERS")"
+    CODE="$(meta_code "$META")"
+    DOWN_FINAL="$(meta_url "$META")"
+    case "$CODE" in
+        200|301|302|303|307|308)
+            if printf '%s' "$DOWN_FINAL" | grep -Eqi '/downloader/?'; then
+                M1_DOWNLOADER_STATUS="HTTP $CODE - ESPOSTO / DA BLOCCARE"
+                print_line "[WARN] /downloader/" "HTTP $CODE - Magento Connect Manager esposto: DA BLOCCARE"
+            else
+                M1_DOWNLOADER_STATUS="redirect/non conclusivo"
+                print_line "[INFO] /downloader/" "redirect fuori dal path; verifica manuale"
+            fi
+            ;;
+        *)
+            M1_DOWNLOADER_STATUS="HTTP $CODE"
+            status_route "/downloader/" "$CODE"
+            ;;
+    esac
 else
-    status_route "/setup/" "$CODE"
+    SETUP_BODY="$TMPDIR/setup.body"
+    SETUP_HEADERS="$TMPDIR/setup.headers"
+    META="$(public_get "${BASE_URL}/setup/" "$SETUP_BODY" "$SETUP_HEADERS")"
+    CODE="$(meta_code "$META")"
+    VER="$(extract_magento_version "$SETUP_BODY" || true)"
+    if [ -n "$VER" ]; then
+        print_line "[LEAK]  /setup/ Magento version" "$VER (HTTP $CODE)"
+        set_version_if_empty "$VER" "/setup/"
+    else
+        status_route "/setup/" "$CODE"
+    fi
 fi
 
 HTML_VER="$(extract_magento_version "$HOME_BODY" || true)"
@@ -819,12 +894,18 @@ if grep -Eqi '/static/version[^/]+/' "$HOME_BODY" 2>/dev/null; then
     print_line "[INFO] Static content signing" "rilevato /static/version... (NON e' la release Magento)"
 fi
 
+if [ -n "$MAGENTO_FAMILY" ]; then
+    print_line "[RESULT] Magento family" "$MAGENTO_FAMILY"
+fi
+
 if [ -n "$MAGENTO_VERSION" ]; then
     print_line "[RESULT] Magento version" "$MAGENTO_VERSION"
     print_line "[INFO] Version source" "$MAGENTO_VERSION_SOURCE"
 else
-    if [ "$MAGENTO_DETECTED" -eq 1 ]; then
-        print_line "[RESULT] Magento version" "Magento 2.x; release 2.4.x non determinabile con affidabilita'"
+    if [ "$MAGENTO_FAMILY" = "Magento 1" ]; then
+        print_line "[RESULT] Magento version" "Magento 1.x; release esatta non determinabile da remoto"
+    elif [ "$MAGENTO_FAMILY" = "Magento 2" ]; then
+        print_line "[RESULT] Magento version" "Magento 2.x; release esatta non determinabile con affidabilita'"
     else
         print_line "[RESULT] Magento version" "non determinata"
     fi
@@ -838,40 +919,55 @@ echo "Probe innocui: nessun payload PHP/RCE viene inviato."
 print_line "[INFO] StyleSmuggler" "https://www.ictsecuritymagazine.com/notizie/zero-day-magento-stylesmuggler-adobe-commerce/"
 echo
 
-BODY="$TMPDIR/graphql-typename.body"; HEAD="$TMPDIR/graphql-typename.headers"
-META="$(public_post_json "${BASE_URL}/graphql" '{"query":"{__typename}"}' "$BODY" "$HEAD")"
-CODE="$(meta_code "$META")"
-status_route "POST /graphql {__typename}" "$CODE"
+if [ "$MAGENTO_FAMILY" = "Magento 1" ]; then
+    print_line "[N/A]  StyleSmuggler" "non applicabile a Magento 1; riguarda Magento/Adobe Commerce 2.x"
+    print_line "[WARN] Magento 1 security status" "patch SUPEE/OpenMage e stato aggiornamenti da verificare lato server"
 
-BODY="$TMPDIR/graphql-store.body"; HEAD="$TMPDIR/graphql-store.headers"
-META="$(public_post_json "${BASE_URL}/graphql" '{"query":"{storeConfig{store_code}}"}' "$BODY" "$HEAD")"
-CODE="$(meta_code "$META")"
-status_route "POST /graphql storeConfig" "$CODE"
-if [ "$CODE" = "200" ] && grep -q 'store_code' "$BODY" 2>/dev/null; then
-    STORE_CODE="$(sed -n 's/.*"store_code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$BODY" | head -1)"
-    [ -n "$STORE_CODE" ] && print_line "[INFO] GraphQL store_code" "$STORE_CODE"
+    BODY="$TMPDIR/m1-soap.body"; HEAD="$TMPDIR/m1-soap.headers"
+    META="$(public_get "${BASE_URL}/api/soap/?wsdl=1" "$BODY" "$HEAD")"
+    CODE="$(meta_code "$META")"
+    status_route "GET /api/soap/?wsdl=1" "$CODE"
+
+    BODY="$TMPDIR/m1-rest.body"; HEAD="$TMPDIR/m1-rest.headers"
+    META="$(public_get "${BASE_URL}/api/rest/" "$BODY" "$HEAD")"
+    CODE="$(meta_code "$META")"
+    status_route "GET /api/rest/" "$CODE"
+else
+    BODY="$TMPDIR/graphql-typename.body"; HEAD="$TMPDIR/graphql-typename.headers"
+    META="$(public_post_json "${BASE_URL}/graphql" '{"query":"{__typename}"}' "$BODY" "$HEAD")"
+    CODE="$(meta_code "$META")"
+    status_route "POST /graphql {__typename}" "$CODE"
+
+    BODY="$TMPDIR/graphql-store.body"; HEAD="$TMPDIR/graphql-store.headers"
+    META="$(public_post_json "${BASE_URL}/graphql" '{"query":"{storeConfig{store_code}}"}' "$BODY" "$HEAD")"
+    CODE="$(meta_code "$META")"
+    status_route "POST /graphql storeConfig" "$CODE"
+    if [ "$CODE" = "200" ] && grep -q 'store_code' "$BODY" 2>/dev/null; then
+        STORE_CODE="$(sed -n 's/.*"store_code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$BODY" | head -1)"
+        [ -n "$STORE_CODE" ] && print_line "[INFO] GraphQL store_code" "$STORE_CODE"
+    fi
+
+    BODY="$TMPDIR/graphql-styles.body"; HEAD="$TMPDIR/graphql-styles.headers"
+    META="$(public_post_json "${BASE_URL}/graphql?styles%5Bsitesmuggler_probe%5D=1" '{"query":"{__typename}"}' "$BODY" "$HEAD")"
+    CODE="$(meta_code "$META")"
+    status_route "POST /graphql?styles[...]" "$CODE"
+
+    detect_waf "$HEAD" "$BODY"
+    PROBE_WAF="$WAF"
+    if [ -n "$PROBE_WAF" ] && [ "$CODE" = "403" ]; then
+        print_line "[INFO] styles probe protection" "$PROBE_WAF ha intercettato la richiesta"
+    fi
+
+    BODY="$TMPDIR/customer-section.body"; HEAD="$TMPDIR/customer-section.headers"
+    META="$(public_get "${BASE_URL}/customer/section/load/?sections=customer&force_new_section_timestamp=true" "$BODY" "$HEAD")"
+    CODE="$(meta_code "$META")"
+    status_route "GET /customer/section/load/" "$CODE"
+
+    BODY="$TMPDIR/paypal.body"; HEAD="$TMPDIR/paypal.headers"
+    META="$(public_post_form "${BASE_URL}/paypal/transparent/response/?sitesmuggler_probe=1" "$BODY" "$HEAD")"
+    CODE="$(meta_code "$META")"
+    status_route "POST /paypal/transparent/response/" "$CODE"
 fi
-
-BODY="$TMPDIR/graphql-styles.body"; HEAD="$TMPDIR/graphql-styles.headers"
-META="$(public_post_json "${BASE_URL}/graphql?styles%5Bsitesmuggler_probe%5D=1" '{"query":"{__typename}"}' "$BODY" "$HEAD")"
-CODE="$(meta_code "$META")"
-status_route "POST /graphql?styles[...]" "$CODE"
-
-detect_waf "$HEAD" "$BODY"
-PROBE_WAF="$WAF"
-if [ -n "$PROBE_WAF" ] && [ "$CODE" = "403" ]; then
-    print_line "[INFO] styles probe protection" "$PROBE_WAF ha intercettato la richiesta"
-fi
-
-BODY="$TMPDIR/customer-section.body"; HEAD="$TMPDIR/customer-section.headers"
-META="$(public_get "${BASE_URL}/customer/section/load/?sections=customer&force_new_section_timestamp=true" "$BODY" "$HEAD")"
-CODE="$(meta_code "$META")"
-status_route "GET /customer/section/load/" "$CODE"
-
-BODY="$TMPDIR/paypal.body"; HEAD="$TMPDIR/paypal.headers"
-META="$(public_post_form "${BASE_URL}/paypal/transparent/response/?sitesmuggler_probe=1" "$BODY" "$HEAD")"
-CODE="$(meta_code "$META")"
-status_route "POST /paypal/transparent/response/" "$CODE"
 
 echo
 echo "-- AMASTY PUBLIC FINGERPRINT --"
@@ -915,9 +1011,16 @@ echo " 6. SUMMARY"
 echo "============================================================"
 echo
 [ -n "$WAF_MAIN" ] && echo "WAF/CDN          : $WAF_MAIN" || echo "WAF/CDN          : non identificato"
+[ -n "$MAGENTO_FAMILY" ] && echo "Magento family   : $MAGENTO_FAMILY" || echo "Magento family   : non determinata"
 [ -n "$MAGENTO_VERSION" ] && echo "Magento version  : $MAGENTO_VERSION ($MAGENTO_VERSION_SOURCE)" || echo "Magento version  : non determinata con affidabilita'"
 [ -n "$MAGENTO_EDITION" ] && echo "Magento edition  : $MAGENTO_EDITION"
 [ -n "$ELASTICSUITE_VERSION" ] && echo "ElasticSuite     : $ELASTICSUITE_VERSION"
+if [ "$MAGENTO_FAMILY" = "Magento 1" ]; then
+    echo "StyleSmuggler    : N/A - non applicabile a Magento 1"
+    echo "M1 downloader    : $M1_DOWNLOADER_STATUS"
+else
+    echo "StyleSmuggler    : superficie Magento 2 verificata"
+fi
 if [ "$MAGENTO_VERSION_PUBLIC" -eq 1 ]; then
     echo "magento_version  : HTTP 200 - DA RIMUOVERE / VERIFICARE"
 else
@@ -955,6 +1058,8 @@ echo
 echo "ACTIVE/REACH = route pubblicamente raggiungibile; NON significa vulnerabile."
 echo "BLOCK/OFF    = route bloccata o non disponibile."
 echo "/magento_version HTTP 200 = endpoint pubblico da rimuovere/verificare con il cliente."
+echo "Magento 1: StyleSmuggler non e' applicabile; patch SUPEE/OpenMage vanno verificate lato server."
+echo "Magento 2: il checker esegue probe innocui su GraphQL e superficie StyleSmuggler."
 echo "Version parser: legge solo la versione associata direttamente a Magento; versioni di ElasticSuite o altri moduli sono separate."
 echo "Amasty: il fingerprint remoto puo' rilevare riferimenti pubblici, ma non prova assenza/presenza completa ne' la versione installata."
 echo "La stringa /static/versionXXXX e' una firma di deployment/cache, non la versione Magento."
