@@ -2,7 +2,7 @@
 
 set -u
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 TARGET="${1:-}"
 TMPDIR=""
 BASE_URL=""
@@ -14,6 +14,9 @@ WAF_MAIN=""
 MAGENTO_DETECTED=0
 MAGENTO_VERSION=""
 MAGENTO_VERSION_SOURCE=""
+MAGENTO_VERSION_PUBLIC=0
+AMASTY_DETECTED=0
+AMASTY_FINGERPRINTS=""
 TTFB_MEDIAN=""
 TTFB_AVERAGE=""
 TTFB_MIN=""
@@ -29,6 +32,9 @@ JS_CDN_RESULT="non determinata"
 IMG_CDN_RESULT="non determinata"
 JS_ASSET_HOSTS=""
 IMG_ASSET_HOSTS=""
+
+UA_STATUS="SiteSmuggler-MagentoStatus/1.5"
+UA_BROWSER="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
 cleanup() {
     [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"
@@ -46,7 +52,7 @@ status_route() {
         401|403) print_line "[BLOCK]  $LABEL" "HTTP $CODE" ;;
         404) print_line "[OFF]    $LABEL" "HTTP 404" ;;
         405) print_line "[BLOCK]  $LABEL" "HTTP 405" ;;
-        000) print_line "[WARN]   $LABEL" "HTTP 000" ;;
+        000|"") print_line "[WARN]   $LABEL" "HTTP 000" ;;
         *) print_line "[REACH]  $LABEL" "HTTP $CODE" ;;
     esac
 }
@@ -67,16 +73,33 @@ normalize_target() {
     DOMAIN="$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]')"
 }
 
+url_origin() {
+    local URL="$1" SCHEME HOST
+    SCHEME="${URL%%:*}"
+    HOST="${URL#*://}"
+    HOST="${HOST%%/*}"
+    case "$SCHEME" in
+        http|https) printf '%s://%s' "$SCHEME" "$HOST" ;;
+        *) printf 'https://%s' "$DOMAIN" ;;
+    esac
+}
+
+url_host() {
+    local URL="$1" H
+    H="${URL#*://}"
+    H="${H%%/*}"
+    H="${H%%:*}"
+    printf '%s' "$H" | tr '[:upper:]' '[:lower:]'
+}
+
 public_get() {
     local URL="$1" BODY="$2" HEADERS="$3" META RC
-    set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.4' \
+        -A "$UA_STATUS" \
         -D "$HEADERS" -o "$BODY" \
         -w '%{http_code}|%{url_effective}|%{remote_ip}' \
         "$URL" 2>/dev/null)"
     RC=$?
-    set -e
 
     if [ "$RC" -ne 0 ]; then
         printf '000||'
@@ -87,16 +110,14 @@ public_get() {
 
 public_post_json() {
     local URL="$1" JSON="$2" BODY="$3" HEADERS="$4" META RC
-    set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.4' \
+        -A "$UA_STATUS" \
         -X POST -H 'Content-Type: application/json' \
         --data "$JSON" \
         -D "$HEADERS" -o "$BODY" \
         -w '%{http_code}|%{url_effective}|%{remote_ip}' \
         "$URL" 2>/dev/null)"
     RC=$?
-    set -e
 
     if [ "$RC" -ne 0 ]; then
         printf '000||'
@@ -107,16 +128,14 @@ public_post_json() {
 
 public_post_form() {
     local URL="$1" BODY="$2" HEADERS="$3" META RC
-    set +e
     META="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 25 \
-        -A 'SiteSmuggler-MagentoStatus/1.4' \
+        -A "$UA_STATUS" \
         -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
         --data 'sitesmuggler_probe=1' \
         -D "$HEADERS" -o "$BODY" \
         -w '%{http_code}|%{url_effective}|%{remote_ip}' \
         "$URL" 2>/dev/null)"
     RC=$?
-    set -e
 
     if [ "$RC" -ne 0 ]; then
         printf '000||'
@@ -186,37 +205,73 @@ detect_magento_markers() {
     return 1
 }
 
+resolve_asset_url() {
+    local SRC="$1" PAGE_URL="$2" ORIGIN BASE
+    ORIGIN="$(url_origin "$PAGE_URL")"
+
+    case "$SRC" in
+        data:*|blob:*|javascript:*|'') return 1 ;;
+        //*) printf '%s:%s' "${PAGE_URL%%:*}" "$SRC" ;;
+        http://*|https://*) printf '%s' "$SRC" ;;
+        /*) printf '%s%s' "$ORIGIN" "$SRC" ;;
+        *)
+            BASE="${PAGE_URL%%\?*}"
+            BASE="${BASE%/*}"
+            printf '%s/%s' "$BASE" "$SRC"
+            ;;
+    esac
+}
+
+extract_asset_urls() {
+    local TYPE="$1" HTML="$2" PAGE_URL="$3" OUT="$4" RAW SRC URL
+    : > "$OUT"
+
+    case "$TYPE" in
+        js)
+            while IFS= read -r RAW; do
+                SRC="$(printf '%s' "$RAW" | sed -E "s/.*src=[\"']([^\"']+)[\"'].*/\1/")"
+                URL="$(resolve_asset_url "$SRC" "$PAGE_URL" || true)"
+                [ -n "$URL" ] && printf '%s\n' "$URL" >> "$OUT"
+            done < <(grep -Eio "<script[^>]+src=[\"'][^\"']+[\"']" "$HTML" 2>/dev/null || true)
+            ;;
+        css)
+            while IFS= read -r RAW; do
+                SRC="$(printf '%s' "$RAW" | sed -E "s/.*href=[\"']([^\"']+)[\"'].*/\1/")"
+                URL="$(resolve_asset_url "$SRC" "$PAGE_URL" || true)"
+                [ -n "$URL" ] && printf '%s\n' "$URL" >> "$OUT"
+            done < <(grep -Eio "<link[^>]+href=[\"'][^\"']+\.css([^\"']*)?[\"']" "$HTML" 2>/dev/null || true)
+            ;;
+        img)
+            while IFS= read -r RAW; do
+                SRC="$(printf '%s' "$RAW" | sed -E "s/.*(src|data-src)=[\"']([^\"']+)[\"'].*/\2/")"
+                URL="$(resolve_asset_url "$SRC" "$PAGE_URL" || true)"
+                [ -n "$URL" ] && printf '%s\n' "$URL" >> "$OUT"
+            done < <(grep -Eio "<img[^>]+(src|data-src)=[\"'][^\"']+[\"']" "$HTML" 2>/dev/null || true)
+            ;;
+    esac
+
+    sort -u "$OUT" -o "$OUT"
+}
+
 scan_home_js_for_version() {
     local HOME="$1" HOME_URL="$2" OUT="$3"
-    local COUNT=0 SRC JSURL JSFILE VER SCHEME
+    local COUNT=0 SRC JSURL JSFILE VER PAGE_HOST ASSET_HOST
 
     : > "$OUT"
     [ -s "$HOME" ] || return 1
-
-    SCHEME="${HOME_URL%%:*}"
-    case "$SCHEME" in
-        http|https) ;;
-        *) SCHEME="https" ;;
-    esac
+    PAGE_HOST="$(url_host "$HOME_URL")"
 
     while IFS= read -r SRC; do
         [ -n "$SRC" ] || continue
+        JSURL="$(resolve_asset_url "$SRC" "$HOME_URL" || true)"
+        [ -n "$JSURL" ] || continue
+        ASSET_HOST="$(url_host "$JSURL")"
+        [ "$ASSET_HOST" = "$PAGE_HOST" ] || continue
 
-        case "$SRC" in
-            //*) JSURL="${SCHEME}:$SRC" ;;
-            http://*|https://*) JSURL="$SRC" ;;
-            /*) JSURL="${SCHEME}://${DOMAIN}${SRC}" ;;
-            *) JSURL="${HOME_URL%/*}/$SRC" ;;
-        esac
-
-        case "$JSURL" in
-            *"$DOMAIN"*) ;;
-            *) continue ;;
-        esac
-
-        JSFILE="$TMPDIR/js-$COUNT"
+        JSFILE="$TMPDIR/version-js-$COUNT"
         curl -ksSL --connect-timeout 5 --max-time 10 \
-            -A 'SiteSmuggler-MagentoStatus/1.4' \
+            -A "$UA_STATUS" \
+            --range 0-1048575 \
             -o "$JSFILE" "$JSURL" 2>/dev/null || true
 
         if [ -s "$JSFILE" ]; then
@@ -234,6 +289,74 @@ scan_home_js_for_version() {
 
     VER="$(extract_magento_version "$OUT" || true)"
     [ -n "$VER" ] && printf '%s' "$VER"
+}
+
+collect_amasty_tokens() {
+    local FILE="$1" OUT="$2"
+    [ -s "$FILE" ] || return 0
+
+    grep -Eio 'Amasty_[A-Za-z0-9_]+' "$FILE" 2>/dev/null >> "$OUT" || true
+    grep -Eio 'Amasty/[A-Za-z0-9_.-]+' "$FILE" 2>/dev/null \
+        | sed -E 's#/#_#' >> "$OUT" || true
+    grep -Eio '/amasty/[A-Za-z0-9_./-]+' "$FILE" 2>/dev/null \
+        | sed -E 's#^/##; s#/#_#g' >> "$OUT" || true
+}
+
+scan_amasty_fingerprints() {
+    local HOME="$1" PAGE_URL="$2"
+    local TOKENS="$TMPDIR/amasty-tokens.txt"
+    local JS_LIST="$TMPDIR/amasty-js.txt"
+    local CSS_LIST="$TMPDIR/amasty-css.txt"
+    local URL FILE COUNT=0 PAGE_HOST ASSET_HOST TOKEN
+    : > "$TOKENS"
+
+    collect_amasty_tokens "$HOME" "$TOKENS"
+
+    extract_asset_urls "js" "$HOME" "$PAGE_URL" "$JS_LIST"
+    extract_asset_urls "css" "$HOME" "$PAGE_URL" "$CSS_LIST"
+    PAGE_HOST="$(url_host "$PAGE_URL")"
+
+    while IFS= read -r URL; do
+        [ -n "$URL" ] || continue
+        ASSET_HOST="$(url_host "$URL")"
+        [ "$ASSET_HOST" = "$PAGE_HOST" ] || continue
+
+        FILE="$TMPDIR/amasty-asset-$COUNT"
+        curl -ksSL --connect-timeout 5 --max-time 10 \
+            -A "$UA_STATUS" \
+            --range 0-1048575 \
+            -o "$FILE" "$URL" 2>/dev/null || true
+        collect_amasty_tokens "$FILE" "$TOKENS"
+
+        COUNT=$((COUNT + 1))
+        [ "$COUNT" -ge 20 ] && break
+    done < <(
+        cat "$JS_LIST" "$CSS_LIST" 2>/dev/null \
+            | awk '!seen[$0]++' \
+            | awk 'BEGIN{IGNORECASE=1} /amasty|requirejs/{print "0\t"$0; next} {print "1\t"$0}' \
+            | sort -k1,1 -k2,2 \
+            | cut -f2-
+    )
+
+    if [ -s "$TOKENS" ]; then
+        sed -E 's/[?#].*$//; s/[^A-Za-z0-9_.-]+$//' "$TOKENS" \
+            | awk 'length($0) > 6' \
+            | sort -fu \
+            | head -20 > "$TMPDIR/amasty-tokens-clean.txt"
+
+        if [ -s "$TMPDIR/amasty-tokens-clean.txt" ]; then
+            AMASTY_DETECTED=1
+            AMASTY_FINGERPRINTS="$(paste -sd ',' "$TMPDIR/amasty-tokens-clean.txt" | sed 's/,/, /g')"
+            while IFS= read -r TOKEN; do
+                [ -n "$TOKEN" ] && print_line "[DETECTED] Amasty fingerprint" "$TOKEN"
+            done < "$TMPDIR/amasty-tokens-clean.txt"
+            print_line "[RESULT] Amasty" "rilevato - versioni/patch da verificare lato server"
+            return 0
+        fi
+    fi
+
+    print_line "[INFO] Amasty fingerprint" "nessun riferimento pubblico rilevato"
+    print_line "[INFO] Amasty note" "assenza fingerprint NON esclude moduli Amasty installati"
 }
 
 ms_from_seconds() {
@@ -269,16 +392,14 @@ run_ttfb_benchmark() {
         [[ "$URL" == *\?* ]] && SEP='&'
         TEST_URL="${URL}${SEP}sitesmuggler_ttfb=$(date +%s%N)-${I}"
 
-        set +e
         RESULT="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 30 \
-            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+            -A "$UA_BROWSER" \
             -H 'Cache-Control: no-cache' \
             -H 'Pragma: no-cache' \
             -o /dev/null \
             -w '%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}' \
             "$TEST_URL" 2>/dev/null)"
         RC=$?
-        set -e
 
         if [ "$RC" -ne 0 ] || [ -z "$RESULT" ]; then
             printf 'TEST %02d | HTTP=000 | errore connessione\n' "$I"
@@ -345,14 +466,12 @@ run_ttfb_cached_benchmark() {
     echo
 
     WARM_HEADERS="$TMPDIR/ttfb-cached-warm.headers"
-    set +e
     WARM_RESULT="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 30 \
-        -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+        -A "$UA_BROWSER" \
         -D "$WARM_HEADERS" -o /dev/null \
         -w '%{http_code}|%{time_starttransfer}|%{time_total}' \
         "$URL" 2>/dev/null)"
     RC=$?
-    set -e
 
     if [ "$RC" -eq 0 ] && [ -n "$WARM_RESULT" ]; then
         IFS='|' read -r WARM_CODE WARM_TTFB WARM_TOTAL <<< "$WARM_RESULT"
@@ -370,14 +489,12 @@ run_ttfb_cached_benchmark() {
     for ((I=1; I<=RUNS; I++)); do
         HEADERS="$TMPDIR/ttfb-cached-${I}.headers"
 
-        set +e
         RESULT="$(curl -ksSL --max-redirs 8 --connect-timeout 8 --max-time 30 \
-            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+            -A "$UA_BROWSER" \
             -D "$HEADERS" -o /dev/null \
             -w '%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}' \
             "$URL" 2>/dev/null)"
         RC=$?
-        set -e
 
         if [ "$RC" -ne 0 ] || [ -z "$RESULT" ]; then
             printf 'CACHE %02d | HTTP=000 | errore connessione\n' "$I"
@@ -431,32 +548,6 @@ run_ttfb_cached_benchmark() {
     print_line "[INFO] Cached avg total response" "${AVG_TOTAL:-n/d} ms"
 }
 
-asset_host() {
-    local URL="$1" H
-    H="${URL#*://}"
-    H="${H%%/*}"
-    H="${H%%:*}"
-    printf '%s' "$H" | tr '[:upper:]' '[:lower:]'
-}
-
-resolve_asset_url() {
-    local SRC="$1" PAGE_URL="$2" SCHEME BASE
-    SCHEME="${PAGE_URL%%:*}"
-    case "$SCHEME" in http|https) ;; *) SCHEME="https" ;; esac
-
-    case "$SRC" in
-        data:*|blob:*|javascript:*|'') return 1 ;;
-        //*) printf '%s:%s' "$SCHEME" "$SRC" ;;
-        http://*|https://*) printf '%s' "$SRC" ;;
-        /*) printf '%s://%s%s' "$SCHEME" "$DOMAIN" "$SRC" ;;
-        *)
-            BASE="${PAGE_URL%%\?*}"
-            BASE="${BASE%/*}"
-            printf '%s/%s' "$BASE" "$SRC"
-            ;;
-    esac
-}
-
 cdn_provider_from_host_headers() {
     local HOST="$1" HEADERS="$2" TEXT
     TEXT="$(cat "$HEADERS" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
@@ -497,27 +588,6 @@ asset_cache_status() {
     [ -n "$VALUE" ] && printf '%s' "$VALUE"
 }
 
-extract_asset_urls() {
-    local TYPE="$1" HTML="$2" PAGE_URL="$3" OUT="$4" RAW SRC URL
-    : > "$OUT"
-
-    if [ "$TYPE" = "js" ]; then
-        while IFS= read -r RAW; do
-            SRC="$(printf '%s' "$RAW" | sed -E "s/.*src=[\"']([^\"']+)[\"'].*/\1/")"
-            URL="$(resolve_asset_url "$SRC" "$PAGE_URL" || true)"
-            [ -n "$URL" ] && printf '%s\n' "$URL" >> "$OUT"
-        done < <(grep -Eio "<script[^>]+src=[\"'][^\"']+[\"']" "$HTML" 2>/dev/null || true)
-    else
-        while IFS= read -r RAW; do
-            SRC="$(printf '%s' "$RAW" | sed -E "s/.*(src|data-src)=[\"']([^\"']+)[\"'].*/\2/")"
-            URL="$(resolve_asset_url "$SRC" "$PAGE_URL" || true)"
-            [ -n "$URL" ] && printf '%s\n' "$URL" >> "$OUT"
-        done < <(grep -Eio "<img[^>]+(src|data-src)=[\"'][^\"']+[\"']" "$HTML" 2>/dev/null || true)
-    fi
-
-    sort -u "$OUT" -o "$OUT"
-}
-
 probe_asset_cdn_type() {
     local TYPE="$1" LIST="$2" MAX="${3:-6}"
     local URL HOST HEADERS PROVIDER CACHE COUNT=0 TOTAL=0 FOUND=0 RC
@@ -538,21 +608,19 @@ probe_asset_cdn_type() {
 
     while IFS= read -r URL; do
         [ -n "$URL" ] || continue
-        HOST="$(asset_host "$URL")"
+        HOST="$(url_host "$URL")"
         [ -n "$HOST" ] || continue
         printf '%s\n' "$HOST" >> "$HOSTS"
 
         HEADERS="$TMPDIR/${TYPE}-asset-${COUNT}.headers"
-        set +e
         curl -ksSIL --max-redirs 5 --connect-timeout 5 --max-time 12 \
-            -A 'SiteSmuggler-MagentoStatus/1.4' \
+            -A "$UA_STATUS" \
             -D "$HEADERS" -o /dev/null "$URL" 2>/dev/null
         RC=$?
-        set -e
         if [ "$RC" -ne 0 ] || [ ! -s "$HEADERS" ]; then
             : > "$HEADERS"
             curl -ksSL --range 0-0 --max-redirs 5 --connect-timeout 5 --max-time 12 \
-                -A 'SiteSmuggler-MagentoStatus/1.4' \
+                -A "$UA_STATUS" \
                 -D "$HEADERS" -o /dev/null "$URL" 2>/dev/null || true
         fi
 
@@ -676,13 +744,20 @@ echo "============================================================"
 MV_BODY="$TMPDIR/magento_version.body"
 MV_HEADERS="$TMPDIR/magento_version.headers"
 META="$(public_get "${BASE_URL}/magento_version" "$MV_BODY" "$MV_HEADERS")"
-CODE="$(meta_code "$META")"
+MV_CODE="$(meta_code "$META")"
 VER="$(extract_any_version "$MV_BODY" || true)"
-if [ -n "$VER" ]; then
-    print_line "[FOUND] /magento_version" "$VER (HTTP $CODE)"
-    set_version_if_empty "$VER" "/magento_version"
+
+if [ "$MV_CODE" = "200" ]; then
+    MAGENTO_VERSION_PUBLIC=1
+    print_line "[WARN] /magento_version" "HTTP 200 - endpoint pubblico: DA RIMUOVERE / VERIFICARE"
+    if [ -n "$VER" ]; then
+        print_line "[LEAK] Versione Magento esposta" "$VER"
+        set_version_if_empty "$VER" "/magento_version"
+    else
+        print_line "[WARN] Information disclosure" "/magento_version pubblicamente raggiungibile"
+    fi
 else
-    status_route "/magento_version" "$CODE"
+    status_route "/magento_version" "$MV_CODE"
 fi
 
 SETUP_BODY="$TMPDIR/setup.body"
@@ -731,41 +806,10 @@ fi
 
 echo
 echo "============================================================"
-echo " 3. ASSET CDN CHECK - JS / IMAGES"
-echo "============================================================"
-
-ASSET_PAGE_URL="${FINAL_URL:-$BASE_URL/}"
-JS_ASSETS="$TMPDIR/assets-js.txt"
-IMG_ASSETS="$TMPDIR/assets-img.txt"
-extract_asset_urls "js" "$HOME_BODY" "$ASSET_PAGE_URL" "$JS_ASSETS"
-extract_asset_urls "img" "$HOME_BODY" "$ASSET_PAGE_URL" "$IMG_ASSETS"
-
-echo "-- JavaScript --"
-probe_asset_cdn_type "js" "$JS_ASSETS" 6
-
-echo
-echo "-- Immagini --"
-probe_asset_cdn_type "img" "$IMG_ASSETS" 6
-
-echo
-echo "============================================================"
-echo " 4. TTFB BENCHMARK"
-echo "============================================================"
-
-TTFB_URL="${FINAL_URL:-$BASE_URL/}"
-
-echo "-- NO-CACHE / CACHE-BUSTER --"
-run_ttfb_benchmark "$TTFB_URL" "$TTFB_RUNS"
-
-echo
-echo "-- MAGENTO / CDN WARM CACHE --"
-run_ttfb_cached_benchmark "$TTFB_URL" "$TTFB_RUNS"
-
-echo
-echo "============================================================"
-echo " 5. GRAPHQL / STYLESMUGGLER SURFACE"
+echo " 3. MAGENTO EXPOSED SURFACE / STYLESMUGGLER / AMASTY"
 echo "============================================================"
 echo "Probe innocui: nessun payload PHP/RCE viene inviato."
+print_line "[INFO] StyleSmuggler" "https://www.ictsecuritymagazine.com/notizie/zero-day-magento-stylesmuggler-adobe-commerce/"
 echo
 
 BODY="$TMPDIR/graphql-typename.body"; HEAD="$TMPDIR/graphql-typename.headers"
@@ -804,12 +848,59 @@ CODE="$(meta_code "$META")"
 status_route "POST /paypal/transparent/response/" "$CODE"
 
 echo
+echo "-- AMASTY PUBLIC FINGERPRINT --"
+scan_amasty_fingerprints "$HOME_BODY" "${FINAL_URL:-$BASE_URL/}"
+
+echo
+echo "============================================================"
+echo " 4. ASSET CDN CHECK - JS / IMAGES"
+echo "============================================================"
+
+ASSET_PAGE_URL="${FINAL_URL:-$BASE_URL/}"
+JS_ASSETS="$TMPDIR/assets-js.txt"
+IMG_ASSETS="$TMPDIR/assets-img.txt"
+extract_asset_urls "js" "$HOME_BODY" "$ASSET_PAGE_URL" "$JS_ASSETS"
+extract_asset_urls "img" "$HOME_BODY" "$ASSET_PAGE_URL" "$IMG_ASSETS"
+
+echo "-- JavaScript --"
+probe_asset_cdn_type "js" "$JS_ASSETS" 6
+
+echo
+echo "-- Immagini --"
+probe_asset_cdn_type "img" "$IMG_ASSETS" 6
+
+echo
+echo "============================================================"
+echo " 5. TTFB BENCHMARK"
+echo "============================================================"
+
+TTFB_URL="${FINAL_URL:-$BASE_URL/}"
+
+echo "-- NO-CACHE / CACHE-BUSTER --"
+run_ttfb_benchmark "$TTFB_URL" "$TTFB_RUNS"
+
+echo
+echo "-- MAGENTO / CDN WARM CACHE --"
+run_ttfb_cached_benchmark "$TTFB_URL" "$TTFB_RUNS"
+
+echo
 echo "============================================================"
 echo " 6. SUMMARY"
 echo "============================================================"
 echo
 [ -n "$WAF_MAIN" ] && echo "WAF/CDN          : $WAF_MAIN" || echo "WAF/CDN          : non identificato"
 [ -n "$MAGENTO_VERSION" ] && echo "Magento version  : $MAGENTO_VERSION ($MAGENTO_VERSION_SOURCE)" || echo "Magento version  : non determinata con affidabilita'"
+if [ "$MAGENTO_VERSION_PUBLIC" -eq 1 ]; then
+    echo "magento_version  : HTTP 200 - DA RIMUOVERE / VERIFICARE"
+else
+    echo "magento_version  : non esposto con HTTP 200"
+fi
+if [ "$AMASTY_DETECTED" -eq 1 ]; then
+    echo "Amasty           : RILEVATO - versioni/patch da verificare lato server"
+    [ -n "$AMASTY_FINGERPRINTS" ] && echo "Amasty refs      : $AMASTY_FINGERPRINTS"
+else
+    echo "Amasty           : nessun fingerprint pubblico rilevato"
+fi
 echo "Remote IP        : ${REMOTE_IP:-n/d}"
 echo "JS CDN           : $JS_CDN_RESULT"
 echo "Image CDN        : $IMG_CDN_RESULT"
@@ -835,6 +926,8 @@ fi
 echo
 echo "ACTIVE/REACH = route pubblicamente raggiungibile; NON significa vulnerabile."
 echo "BLOCK/OFF    = route bloccata o non disponibile."
+echo "/magento_version HTTP 200 = endpoint pubblico da rimuovere/verificare con il cliente."
+echo "Amasty: il fingerprint remoto puo' rilevare riferimenti pubblici, ma non prova assenza/presenza completa ne' la versione installata."
 echo "La stringa /static/versionXXXX e' una firma di deployment/cache, non la versione Magento."
 echo "Asset CDN: il checker verifica host e header CDN/cache su campioni JS e immagini della homepage."
 echo "TTFB no-cache: cache-buster + no-cache. TTFB cached: warm-up e richieste ripetute allo stesso URL con cache consentita."
