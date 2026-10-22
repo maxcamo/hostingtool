@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 clear
 set -Eeuo pipefail
+# Segnala anche gli errori imprevisti: con set -e una pipeline puo' fermare lo script.
+trap 'rc=$?; echo "ERRORE: interruzione inattesa alla riga ${LINENO} (exit ${rc})." >&2' ERR
 
 if (( EUID != 0 )); then
   echo 'ERRORE: eseguire come root (sudo bash script.sh).'
@@ -72,7 +74,7 @@ apt-get update
 
 printf '\n=== VERIFICA VERSIONI DISPONIBILI ===\n'
 for v in "${PHP_VERS[@]}"; do
-  candidate=$(apt-cache policy "php${v}-common" | awk '/Candidate:/ {print $2; exit}')
+  candidate=$(apt-cache policy "php${v}-common" | awk '/Candidate:/ {candidate=$2} END {if (candidate != "") print candidate}')
   echo "PHP $v: candidato $candidate (minimo upstream ${MIN[$v]})"
   if [[ -z "$candidate" || "$candidate" == '(none)' ]] ||
      ! dpkg --compare-versions "$candidate" ge "${MIN[$v]}"; then
