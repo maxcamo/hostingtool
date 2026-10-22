@@ -14,6 +14,7 @@ if ! command -v apt-get >/dev/null || ! command -v dpkg-query >/dev/null; then
 fi
 
 printf '=== SERVER: %s ===\n' "$(hostname -f 2>/dev/null || hostname)"
+echo "Versione script: 2026-10-22.3 (diagnostica APT)"
 . /etc/os-release
 printf 'Sistema: %s\n' "${PRETTY_NAME:-sconosciuto}"
 
@@ -74,7 +75,15 @@ apt-get update
 
 printf '\n=== VERIFICA VERSIONI DISPONIBILI ===\n'
 for v in "${PHP_VERS[@]}"; do
-  candidate=$(apt-cache policy "php${v}-common" | awk '/Candidate:/ {candidate=$2} END {if (candidate != "") print candidate}')
+  echo "Controllo PHP $v: lettura apt-cache policy..."
+  if ! policy_output=$(apt-cache policy "php${v}-common" 2>&1); then
+    printf 'STOP: impossibile consultare APT per PHP %s. Output:\n%s\n' "$v" "$policy_output"
+    exit 1
+  fi
+  if ! candidate=$(awk '$1 == "Candidate:" { print $2; found=1; exit } END { if (!found) exit 1 }' <<< "$policy_output"); then
+    printf 'STOP: nessuna versione candidata per PHP %s. Output:\n%s\n' "$v" "$policy_output"
+    exit 1
+  fi
   echo "PHP $v: candidato $candidate (minimo upstream ${MIN[$v]})"
   if [[ -z "$candidate" || "$candidate" == '(none)' ]] ||
      ! dpkg --compare-versions "$candidate" ge "${MIN[$v]}"; then
