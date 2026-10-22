@@ -14,7 +14,7 @@ if ! command -v apt-get >/dev/null || ! command -v dpkg-query >/dev/null; then
 fi
 
 printf '=== SERVER: %s ===\n' "$(hostname -f 2>/dev/null || hostname)"
-echo "Versione script: 2026-10-22.3 (diagnostica APT)"
+echo "Versione script: 2026-10-22.4 (conservazione config PHP)"
 . /etc/os-release
 printf 'Sistema: %s\n' "${PRETTY_NAME:-sconosciuto}"
 
@@ -128,7 +128,8 @@ if [[ -d /etc/php ]]; then
 fi
 
 printf '\n=== INSTALLAZIONE PATCH PHP ===\n'
-apt-get -y --no-remove install --only-upgrade --no-install-recommends "${PHP_PKGS[@]}"
+# Mantenere sempre le configurazioni PHP personalizzate durante gli upgrade.
+DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::="--force-confold" --no-remove install --only-upgrade --no-install-recommends "${PHP_PKGS[@]}"
 
 printf '\n=== VERIFICA CONFIGURAZIONE FPM E RIAVVIO ===\n'
 for v in "${FPM_ACTIVE[@]}"; do
